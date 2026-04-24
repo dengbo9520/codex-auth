@@ -254,11 +254,26 @@ function getAccountTypeLabel(account: { plan: string }) {
   return isWorkspaceAccount(account.plan) ? "空间" : "个人";
 }
 
-function getAccountSpaceLabel(account: {
-  plan: string;
-  accountName: string | null;
-}) {
-  const value = account.accountName?.trim();
+function buildAccountNameByChatgptAccountId(accounts: AccountItem[]) {
+  const names = new Map<string, string>();
+  for (const account of accounts) {
+    const accountId = account.chatgptAccountId?.trim();
+    const accountName = account.accountName?.trim();
+    if (accountId && accountName && !names.has(accountId)) {
+      names.set(accountId, accountName);
+    }
+  }
+  return names;
+}
+
+function getAccountSpaceLabel(
+  account: {
+    plan: string;
+    accountName: string | null;
+  },
+  fallbackAccountName?: string,
+) {
+  const value = account.accountName?.trim() || fallbackAccountName?.trim();
   if (value) {
     return value;
   }
@@ -907,6 +922,9 @@ export default function App() {
 
   const snapshot = snapshotQuery.data;
   const activeAccount = snapshot.dashboard.activeAccount;
+  const accountNameByChatgptAccountId = buildAccountNameByChatgptAccountId(
+    snapshot.registry.accounts,
+  );
   const filteredAccounts = filterAccounts(
     snapshot.registry.accounts,
     deferredAccountsSearch,
@@ -1054,6 +1072,7 @@ export default function App() {
                 {page === "accounts" ? (
                   <AccountsPage
                     accounts={filteredAccounts}
+                    accountNameByChatgptAccountId={accountNameByChatgptAccountId}
                     totalAccounts={snapshot.registry.accounts.length}
                     searchValue={accountsSearch}
                     pendingAction={pendingAction}
@@ -1125,6 +1144,12 @@ function GlobalWarnings({ warnings }: { warnings: string[] }) {
 
 function DashboardPage({ snapshot }: { snapshot: AppSnapshotDto }) {
   const activeAccount = snapshot.dashboard.activeAccount;
+  const accountNameByChatgptAccountId = buildAccountNameByChatgptAccountId(
+    snapshot.registry.accounts,
+  );
+  const activeAccountFallbackName = activeAccount?.chatgptAccountId
+    ? accountNameByChatgptAccountId.get(activeAccount.chatgptAccountId)
+    : undefined;
 
   return (
     <div className="space-y-6">
@@ -1153,7 +1178,10 @@ function DashboardPage({ snapshot }: { snapshot: AppSnapshotDto }) {
                 </div>
                 <CardDescription className="space-y-1">
                   <div>别名：{fallbackText(activeAccount.alias, "未设置")}</div>
-                  <div>所属空间：{getAccountSpaceLabel(activeAccount)}</div>
+                  <div>
+                    所属空间：
+                    {getAccountSpaceLabel(activeAccount, activeAccountFallbackName)}
+                  </div>
                 </CardDescription>
               </>
             ) : (
@@ -1251,6 +1279,7 @@ function DashboardPage({ snapshot }: { snapshot: AppSnapshotDto }) {
 
 function AccountsPage({
   accounts,
+  accountNameByChatgptAccountId,
   totalAccounts,
   searchValue,
   pendingAction,
@@ -1261,6 +1290,7 @@ function AccountsPage({
   onSetAlias,
 }: {
   accounts: AccountItem[];
+  accountNameByChatgptAccountId: Map<string, string>;
   totalAccounts: number;
   searchValue: string;
   pendingAction: AppAction | null;
@@ -1312,6 +1342,9 @@ function AccountsPage({
             </TableHeader>
             <TableBody>
               {accounts.map((account) => {
+                const fallbackAccountName = account.chatgptAccountId
+                  ? accountNameByChatgptAccountId.get(account.chatgptAccountId)
+                  : undefined;
                 const switchBusy =
                   pendingAction?.kind === "switch" &&
                   pendingAction.query === account.accountKey;
@@ -1340,16 +1373,16 @@ function AccountsPage({
                       </Badge>
                     </TableCell>
                     <TableCell className="whitespace-normal align-top">
-                      {getAccountSpaceLabel(account)}
+                      {getAccountSpaceLabel(account, fallbackAccountName)}
                     </TableCell>
                     <TableCell className="whitespace-normal align-top">
                       {fallbackText(account.plan, "未知")}
                     </TableCell>
                     <TableCell className="whitespace-normal align-top">
-                      {formatPercent(account.primaryUsage?.remainingPercent)}
+                      <UsageQuotaCell usage={account.primaryUsage} />
                     </TableCell>
                     <TableCell className="whitespace-normal align-top">
-                      {formatPercent(account.weeklyUsage?.remainingPercent)}
+                      <UsageQuotaCell usage={account.weeklyUsage} />
                     </TableCell>
                     <TableCell className="whitespace-normal align-top">
                       <div>{formatRelative(account.lastUsedAtMs ?? account.lastUsageAtMs)}</div>
@@ -1443,6 +1476,32 @@ function AccountsPage({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function UsageQuotaCell({
+  usage,
+}: {
+  usage: AccountItem["primaryUsage"] | null;
+}) {
+  const resetAtMs = usage?.resetsAtMs ?? null;
+
+  return (
+    <div className="space-y-1">
+      <div>{formatPercent(usage?.remainingPercent)}</div>
+      {resetAtMs ? (
+        <>
+          <div className="text-sm text-muted-foreground">
+            恢复：{formatShortTimestamp(resetAtMs)}
+          </div>
+          <div className="text-xs text-muted-foreground">
+            {formatRelative(resetAtMs)}
+          </div>
+        </>
+      ) : (
+        <div className="text-sm text-muted-foreground">恢复：暂无</div>
+      )}
+    </div>
   );
 }
 
@@ -1796,6 +1855,12 @@ function SettingsPage({
   onLaunchLogin: (deviceAuth: boolean) => Promise<void>;
 }) {
   const activeAccount = snapshot.dashboard.activeAccount;
+  const accountNameByChatgptAccountId = buildAccountNameByChatgptAccountId(
+    snapshot.registry.accounts,
+  );
+  const activeAccountFallbackName = activeAccount?.chatgptAccountId
+    ? accountNameByChatgptAccountId.get(activeAccount.chatgptAccountId)
+    : undefined;
 
   return (
     <div className="grid gap-4 xl:grid-cols-2">
@@ -1910,7 +1975,11 @@ function SettingsPage({
             <MetricCard
               label="账号类型"
               value={activeAccount ? getAccountTypeLabel(activeAccount) : "未知"}
-              detail={activeAccount ? getAccountSpaceLabel(activeAccount) : "未获取"}
+              detail={
+                activeAccount
+                  ? getAccountSpaceLabel(activeAccount, activeAccountFallbackName)
+                  : "未获取"
+              }
             />
             <MetricCard
               label="切换后动作"
