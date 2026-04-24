@@ -810,7 +810,7 @@ pub fn launch_login(device_auth: bool, state: State<'_, AppState>) -> CommandExe
             if device_auth {
                 "已打开外部 PowerShell 登录窗口。".to_string()
             } else {
-                "已打开外部 PowerShell 登录窗口，并会自动打开授权网页。".to_string()
+                "已打开外部 PowerShell 登录窗口；授权网页由 codex-auth 打开。".to_string()
             },
             String::new(),
         ),
@@ -838,7 +838,6 @@ fn write_web_login_script(script_path: &Path, target_path: &Path) -> std::io::Re
     let target = powershell_escape(&path_string(target_path));
     let script = format!(
         r#"$ErrorActionPreference = 'Continue'
-$opened = $false
 
 & '{target}' login 2>&1 | ForEach-Object {{
     if ($_ -is [System.Management.Automation.ErrorRecord]) {{
@@ -847,14 +846,6 @@ $opened = $false
         $line = $_.ToString().Trim()
     }}
     Write-Host $line
-
-    if (-not $opened -and $line -match 'https://auth\.openai\.com/oauth/authorize\?\S+') {{
-        $opened = $true
-        $url = $Matches[0]
-        Write-Host ''
-        Write-Host 'Opening browser for Codex login...'
-        Start-Process $url
-    }}
 }}
 
 $exitCode = $LASTEXITCODE
