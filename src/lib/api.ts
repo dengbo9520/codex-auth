@@ -13,6 +13,9 @@ export const api = {
   refreshRegistrySnapshot() {
     return invoke<MutationResultDto>("refresh_registry_snapshot");
   },
+  getLocalRegistrySnapshot() {
+    return invoke<MutationResultDto>("get_local_registry_snapshot");
+  },
   runCodexAuthStatus() {
     return invoke<CommandExecutionDto>("run_codex_auth_status");
   },

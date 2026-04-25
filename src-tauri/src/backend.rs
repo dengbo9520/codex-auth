@@ -558,6 +558,42 @@ pub async fn refresh_registry_snapshot(
 }
 
 #[tauri::command]
+pub fn get_local_registry_snapshot(state: State<'_, AppState>) -> MutationResultDto {
+    let started_at_ms = now_ms();
+    let account_auth_statuses = extract_account_auth_statuses(&state.recent_logs());
+    let registry_started_at_ms = now_ms();
+    let registry = read_registry_snapshot(&state.dirs, &account_auth_statuses);
+    let registry_duration_ms = now_ms() - registry_started_at_ms;
+    let duration_ms = now_ms() - started_at_ms;
+    state.push_perf(
+        "local-refresh.registry-read",
+        registry_duration_ms,
+        format!("{} accounts", registry.accounts.len()),
+    );
+    state.push_perf(
+        "local-refresh.total",
+        duration_ms,
+        format!("{} accounts, {} warnings", registry.accounts.len(), registry.warnings.len()),
+    );
+
+    let command = CommandExecutionDto::synthetic(
+        "local-refresh",
+        "registry.json",
+        "read local registry",
+        vec!["local-refresh".to_string()],
+        &state.dirs.codex_root,
+        true,
+        format!(
+            "Read local registry in {duration_ms} ms; {} accounts.",
+            registry.accounts.len()
+        ),
+        String::new(),
+    );
+    state.push_log(command.clone());
+    MutationResultDto { command, registry }
+}
+
+#[tauri::command]
 pub fn switch_account(query: String, state: State<'_, AppState>) -> MutationResultDto {
     let selector = resolve_account_selector(&state.dirs, &query, "switch");
     let target_account_key = selector

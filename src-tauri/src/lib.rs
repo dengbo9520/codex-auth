@@ -20,6 +20,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             backend::get_app_snapshot,
+            backend::get_local_registry_snapshot,
             backend::run_codex_auth_status,
             backend::refresh_registry_snapshot,
             backend::switch_account,

@@ -621,8 +621,7 @@ export default function App() {
 
   const pendingAction = actionMutation.isPending ? actionMutation.variables : null;
   const busyKind = pendingAction?.kind ?? null;
-  const refreshPending =
-    manualRefreshPending || backgroundRefreshPending || snapshotQuery.isFetching;
+  const refreshPending = manualRefreshPending || snapshotQuery.isFetching;
 
   async function logUiEvent(name: string, detail?: unknown) {
     try {
@@ -642,7 +641,20 @@ export default function App() {
   async function refreshRegistryState(options?: {
     toastOnFailure?: boolean;
     refreshStatus?: boolean;
+    immediateLocal?: boolean;
   }) {
+    if (options?.immediateLocal) {
+      const localStartedAt = performance.now();
+      const localResult = await api.getLocalRegistrySnapshot();
+      await refetchSnapshotAndStatus(Boolean(options?.refreshStatus));
+      await logUiEvent("local-refresh-result", {
+        success: localResult.command.success,
+        commandDurationMs: localResult.command.durationMs,
+        totalDurationMs: Math.round(performance.now() - localStartedAt),
+        accountCount: localResult.registry.accounts.length,
+      });
+    }
+
     const result = await api.refreshRegistrySnapshot();
 
     if (!result.command.success && options?.toastOnFailure) {
@@ -930,6 +942,7 @@ export default function App() {
       const result = await refreshRegistryState({
         toastOnFailure: true,
         refreshStatus: true,
+        immediateLocal: true,
       });
       await logUiEvent("header-refresh-result", {
         success: result.command.success,
@@ -1040,6 +1053,22 @@ export default function App() {
       });
       return;
     }
+
+    void api
+      .getLocalRegistrySnapshot()
+      .then(async (localResult) => {
+        await refetchSnapshotAndStatus(page === "diagnostics");
+        await logUiEvent("background-local-refresh-result", {
+          success: localResult.command.success,
+          commandDurationMs: localResult.command.durationMs,
+          accountCount: localResult.registry.accounts.length,
+        });
+      })
+      .catch((error) => {
+        void logUiEvent("background-local-refresh-error", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
 
     backgroundRefreshInFlightRef.current = true;
     setBackgroundRefreshPending(true);
