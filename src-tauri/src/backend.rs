@@ -1840,6 +1840,8 @@ fn run_resolved_command(
     let stderr = stderr_handle.join().unwrap_or_default();
     let finished_at_ms = now_ms();
 
+    let cleanup_failed_after_output = is_auto_task_cleanup_failure(category, &stdout, &stderr);
+
     CommandExecutionDto {
         id: next_command_id(),
         category: category.to_string(),
@@ -1851,7 +1853,7 @@ fn run_resolved_command(
         finished_at_ms,
         duration_ms: finished_at_ms - started_at_ms,
         exit_code: status.code(),
-        success: status.success() && !timed_out,
+        success: (status.success() || cleanup_failed_after_output) && !timed_out,
         timed_out,
         stdout,
         stderr: if timed_out && stderr.is_empty() {
@@ -1860,6 +1862,13 @@ fn run_resolved_command(
             stderr
         },
     }
+}
+
+fn is_auto_task_cleanup_failure(category: &str, stdout: &str, stderr: &str) -> bool {
+    category == "refresh-registry"
+        && !stdout.trim().is_empty()
+        && stderr.contains("Unregister-ScheduledTask")
+        && (stderr.contains("Access is denied") || stderr.contains("拒绝访问"))
 }
 
 #[cfg(target_os = "windows")]
