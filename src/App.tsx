@@ -377,6 +377,13 @@ function isKnownUsableAccount(account: AccountItem) {
   return hasKnownRemainingUsage(account);
 }
 
+function shouldAutoVerifyAccount(account: AccountItem) {
+  return (
+    account.authStatus === "usage_unauthorized" &&
+    account.verificationCheckedAtMs === null
+  );
+}
+
 function shouldAutoSwitchAccount(account: AccountItem | null | undefined) {
   if (!account) {
     return false;
@@ -545,6 +552,7 @@ export default function App() {
   const lastGuiAutoSwitchAttemptRef = useRef<
     { key: string; attemptedAtMs: number } | undefined
   >(undefined);
+  const autoVerificationInFlightRef = useRef(false);
   const deferredAccountsSearch = useDeferredValue(accountsSearch);
 
   useEffect(() => {
@@ -1059,6 +1067,45 @@ export default function App() {
     }
   }
 
+  async function maybeRunAutoVerification(registry: AppSnapshotDto["registry"]) {
+    if (autoVerificationInFlightRef.current || actionMutation.isPending) {
+      return;
+    }
+
+    const target = registry.accounts.find(shouldAutoVerifyAccount);
+    if (!target) {
+      return;
+    }
+
+    autoVerificationInFlightRef.current = true;
+    await logUiEvent("auto-verification-start", {
+      target: getAccountDisplayLabel(target),
+      targetAccountKey: target.accountKey,
+      authStatus: target.authStatus,
+      authStatusCode: target.authStatusCode,
+    });
+
+    try {
+      const result = await api.verifyAccountState(target.accountKey);
+      await logUiEvent("auto-verification-result", {
+        target: getAccountDisplayLabel(target),
+        success: result.command.success,
+        state: result.state,
+        label: result.label,
+        detail: result.detail,
+        switchedBack: result.switchedBack,
+      });
+      await refetchSnapshotAndStatus(page === "diagnostics");
+    } catch (error) {
+      await logUiEvent("auto-verification-error", {
+        target: getAccountDisplayLabel(target),
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      autoVerificationInFlightRef.current = false;
+    }
+  }
+
   const runBackgroundRefresh = useEffectEvent(async () => {
     if (!initialized || !snapshotQuery.data) {
       await logUiEvent("background-refresh-skip", {
@@ -1129,6 +1176,7 @@ export default function App() {
         stderr: result.command.stderr,
       });
       if (result.command.success) {
+        await maybeRunAutoVerification(result.registry);
         await maybeRunGuiAutoSwitch(result.registry);
       }
     } finally {
@@ -1711,6 +1759,19 @@ function AccountsPage({
                         {account.authStatusDetail ? (
                           <div className="text-sm text-muted-foreground">
                             {account.authStatusDetail}
+                          </div>
+                        ) : null}
+                        {account.verificationLabel ? (
+                          <div className="text-sm text-muted-foreground">
+                            验证：{account.verificationLabel}
+                            {account.verificationCheckedAtMs
+                              ? ` · ${formatRelative(account.verificationCheckedAtMs)}`
+                              : ""}
+                          </div>
+                        ) : null}
+                        {account.verificationDetail ? (
+                          <div className="text-xs text-muted-foreground">
+                            {account.verificationDetail}
                           </div>
                         ) : null}
                         <AccountLifecycleDetail account={account} />

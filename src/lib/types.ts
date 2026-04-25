@@ -36,6 +36,10 @@ export interface AccountDto {
   subscriptionActiveUntil: string | null;
   subscriptionLastChecked: string | null;
   subscriptionPlan: string | null;
+  verificationState: string | null;
+  verificationLabel: string | null;
+  verificationDetail: string | null;
+  verificationCheckedAtMs: number | null;
   primaryUsage: UsageWindowDto | null;
   weeklyUsage: UsageWindowDto | null;
 }

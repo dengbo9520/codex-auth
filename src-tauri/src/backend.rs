@@ -248,6 +248,10 @@ pub struct AccountDto {
     pub subscription_active_until: Option<String>,
     pub subscription_last_checked: Option<String>,
     pub subscription_plan: Option<String>,
+    pub verification_state: Option<String>,
+    pub verification_label: Option<String>,
+    pub verification_detail: Option<String>,
+    pub verification_checked_at_ms: Option<i64>,
     pub primary_usage: Option<UsageWindowDto>,
     pub weekly_usage: Option<UsageWindowDto>,
 }
@@ -339,6 +343,7 @@ struct RegistryFile {
     auto_switch: RegistryAutoSwitch,
     api: RegistryApi,
     accounts: Vec<RegistryAccount>,
+    gui_status_checks: HashMap<String, RegistryStatusCheck>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -352,6 +357,15 @@ struct RegistryAutoSwitch {
 struct RegistryApi {
     usage: bool,
     account: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RegistryStatusCheck {
+    state: Option<String>,
+    label: Option<String>,
+    detail: Option<String>,
+    checked_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -585,7 +599,11 @@ pub fn get_local_registry_snapshot(state: State<'_, AppState>) -> MutationResult
     state.push_perf(
         "local-refresh.total",
         duration_ms,
-        format!("{} accounts, {} warnings", registry.accounts.len(), registry.warnings.len()),
+        format!(
+            "{} accounts, {} warnings",
+            registry.accounts.len(),
+            registry.warnings.len()
+        ),
     );
 
     let command = CommandExecutionDto::synthetic(
@@ -670,7 +688,7 @@ pub fn verify_account_state(
 
     let selector = resolve_account_selector(&state.dirs, &target_key, "switch");
     let mut command = match selector {
-        Ok(selector) => run_query_command(&state, "switch", "verify-account", selector.query),
+        Ok(selector) => run_query_command(&state, "verify-account", "switch", selector.query),
         Err(error) => CommandExecutionDto::synthetic(
             "verify-account",
             "codex-auth",
@@ -689,12 +707,15 @@ pub fn verify_account_state(
 
     if previous_key.as_deref() != Some(&target_key) {
         if let Some(query) = previous_query {
-            let restore_command = run_query_command(&state, "switch", "verify-restore", query);
+            let restore_command = run_query_command(&state, "verify-restore", "switch", query);
             switched_back = restore_command.success;
             append_stdout_line(
                 &mut command.stdout,
-                format!("restore previous active account: success={}", restore_command.success)
-                    .as_str(),
+                format!(
+                    "restore previous active account: success={}",
+                    restore_command.success
+                )
+                .as_str(),
             );
             state.push_log(restore_command);
         }
@@ -702,7 +723,6 @@ pub fn verify_account_state(
         switched_back = true;
     }
 
-    let registry = read_registry_snapshot(&state.dirs, &HashMap::new());
     let (state_label, label, detail) = if !command.success {
         (
             "verify_failed".to_string(),
@@ -742,11 +762,23 @@ pub fn verify_account_state(
         &mut command.stdout,
         format!("verification: {label}; switched_back={switched_back}").as_str(),
     );
+
+    match write_account_verification(&state.dirs, &target_key, &state_label, &label, &detail) {
+        Ok(backup_path) => append_stdout_line(
+            &mut command.stdout,
+            format!("cached verification in registry.json; backup={backup_path}").as_str(),
+        ),
+        Err(error) => append_stdout_line(
+            &mut command.stdout,
+            format!("failed to cache verification: {error}").as_str(),
+        ),
+    }
+
     state.push_log(command.clone());
 
     AccountVerificationDto {
         command,
-        registry,
+        registry: read_registry_snapshot(&state.dirs, &HashMap::new()),
         account_key: target_key,
         state: state_label,
         label,
@@ -1353,16 +1385,19 @@ fn read_registry_snapshot(
 
     let email_counts = account_email_counts(&parsed.accounts);
     let active_account_key = parsed.active_account_key.clone();
+    let gui_status_checks = parsed.gui_status_checks;
     let mut accounts = parsed
         .accounts
         .into_iter()
         .map(|account| {
+            let verification = gui_status_checks.get(&account.account_key);
             registry_account_to_dto(
                 dirs,
                 account,
                 active_account_key.as_deref(),
                 account_auth_statuses,
                 &email_counts,
+                verification,
             )
         })
         .collect::<Vec<_>>();
@@ -1398,6 +1433,7 @@ fn registry_account_to_dto(
     active_account_key: Option<&str>,
     account_auth_statuses: &HashMap<String, AccountAuthStatus>,
     email_counts: &HashMap<String, usize>,
+    verification: Option<&RegistryStatusCheck>,
 ) -> AccountDto {
     let auth_status = find_account_auth_status(&account, account_auth_statuses, email_counts);
     let auth_metadata = read_account_auth_metadata(dirs, &account.account_key);
@@ -1429,6 +1465,10 @@ fn registry_account_to_dto(
         subscription_active_until: auth_metadata.subscription_active_until,
         subscription_last_checked: auth_metadata.subscription_last_checked,
         subscription_plan: auth_metadata.subscription_plan,
+        verification_state: verification.and_then(|check| check.state.clone()),
+        verification_label: verification.and_then(|check| check.label.clone()),
+        verification_detail: verification.and_then(|check| check.detail.clone()),
+        verification_checked_at_ms: verification.and_then(|check| check.checked_at_ms),
         primary_usage: account
             .last_usage
             .as_ref()
@@ -2013,7 +2053,10 @@ fn write_auto_switch_enabled(dirs: &InternalDirectories, enabled: bool) -> Resul
 fn write_usage_api_enabled(dirs: &InternalDirectories, enabled: bool) -> Result<String, String> {
     write_registry_bools(
         dirs,
-        &[(&["api", "usage"][..], enabled), (&["api", "account"][..], enabled)],
+        &[
+            (&["api", "usage"][..], enabled),
+            (&["api", "account"][..], enabled),
+        ],
         "usage API",
         "api",
     )
@@ -2083,6 +2126,38 @@ fn set_json_bool_path(
     }
     current.insert((*leaf).to_string(), serde_json::Value::Bool(enabled));
     Ok(())
+}
+
+fn write_account_verification(
+    dirs: &InternalDirectories,
+    account_key: &str,
+    state: &str,
+    label: &str,
+    detail: &str,
+) -> Result<String, String> {
+    let mut parsed = read_registry_json(dirs, "account verification")?;
+    let root = parsed
+        .as_object_mut()
+        .ok_or_else(|| "registry root is not a JSON object.".to_string())?;
+    let checks = root
+        .entry("gui_status_checks".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "registry field 'gui_status_checks' is not a JSON object.".to_string())?;
+
+    checks.insert(
+        account_key.to_string(),
+        serde_json::json!({
+            "state": state,
+            "label": label,
+            "detail": detail,
+            "checked_at_ms": now_ms()
+        }),
+    );
+
+    let backup_path = backup_registry(dirs, "verify")?;
+    write_registry_json(dirs, &parsed, "account verification")?;
+    Ok(path_string(&backup_path))
 }
 
 fn backup_registry(dirs: &InternalDirectories, label: &str) -> Result<PathBuf, String> {
