@@ -488,11 +488,18 @@ pub fn switch_account(query: String, state: State<'_, AppState>) -> MutationResu
     if command.success {
         if let Some(account_key) = target_account_key {
             if registry.active_account_key.as_deref() != Some(account_key.as_str()) {
-                command.success = false;
-                command.exit_code = Some(1);
-                command.stderr = format!(
-                    "codex-auth switch completed but active account is not requested account: {}",
-                    account_key
+                let active_summary = registry
+                    .accounts
+                    .iter()
+                    .find(|account| account.active)
+                    .map(account_display_summary)
+                    .unwrap_or_else(|| "unknown active account".to_string());
+                append_stdout_line(
+                    &mut command.stdout,
+                    format!(
+                        "codex-auth activated a different account than requested; GUI follows actual active account: {active_summary}"
+                    )
+                    .as_str(),
                 );
             }
         }
@@ -1042,6 +1049,7 @@ fn read_registry_snapshot(
         }
     };
 
+    let email_counts = account_email_counts(&parsed.accounts);
     let active_account_key = parsed.active_account_key.clone();
     let mut accounts = parsed
         .accounts
@@ -1051,6 +1059,7 @@ fn read_registry_snapshot(
                 account,
                 active_account_key.as_deref(),
                 account_auth_statuses,
+                &email_counts,
             )
         })
         .collect::<Vec<_>>();
@@ -1084,8 +1093,9 @@ fn registry_account_to_dto(
     account: RegistryAccount,
     active_account_key: Option<&str>,
     account_auth_statuses: &HashMap<String, AccountAuthStatus>,
+    email_counts: &HashMap<String, usize>,
 ) -> AccountDto {
-    let auth_status = account_auth_statuses.get(&account.email.to_lowercase());
+    let auth_status = find_account_auth_status(&account, account_auth_statuses, email_counts);
     AccountDto {
         active: active_account_key
             .map(|key| key == account.account_key)
@@ -1119,6 +1129,48 @@ fn registry_account_to_dto(
             .and_then(|usage| usage.secondary.as_ref())
             .map(usage_window_to_dto),
     }
+}
+
+fn account_email_counts(accounts: &[RegistryAccount]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for account in accounts {
+        *counts.entry(account.email.to_lowercase()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn find_account_auth_status<'a>(
+    account: &RegistryAccount,
+    account_auth_statuses: &'a HashMap<String, AccountAuthStatus>,
+    email_counts: &HashMap<String, usize>,
+) -> Option<&'a AccountAuthStatus> {
+    for key in account_status_lookup_keys(account) {
+        if let Some(status) = account_auth_statuses.get(&key) {
+            return Some(status);
+        }
+    }
+
+    let email_key = account.email.to_lowercase();
+    if email_counts.get(&email_key).copied().unwrap_or_default() == 1 {
+        return account_auth_statuses.get(&email_key);
+    }
+
+    None
+}
+
+fn account_status_lookup_keys(account: &RegistryAccount) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(alias) = trimmed_optional_str(account.alias.as_deref()) {
+        keys.push(normalize_account_status_key(
+            format!("{} | {}", account.email, alias).as_str(),
+        ));
+    }
+    if let Some(account_name) = trimmed_optional_str(account.account_name.as_deref()) {
+        keys.push(normalize_account_status_key(
+            format!("{} | {}", account.email, account_name).as_str(),
+        ));
+    }
+    keys
 }
 
 fn usage_window_to_dto(window: &RegistryUsageWindow) -> UsageWindowDto {
@@ -1169,12 +1221,12 @@ fn parse_account_auth_statuses(log: &CommandExecutionDto) -> HashMap<String, Acc
         }
 
         let payload = &line["[debug] response usage: ".len()..];
-        let Some((email, tail)) = payload.split_once(" status=") else {
+        let Some((display_name, tail)) = payload.split_once(" status=") else {
             continue;
         };
 
-        let email = email.trim().to_lowercase();
-        if email.is_empty() {
+        let status_key = normalize_account_status_key(display_name);
+        if status_key.is_empty() {
             continue;
         }
 
@@ -1187,7 +1239,7 @@ fn parse_account_auth_statuses(log: &CommandExecutionDto) -> HashMap<String, Acc
         };
 
         statuses.insert(
-            email,
+            status_key,
             AccountAuthStatus {
                 state,
                 status_code,
@@ -1198,6 +1250,16 @@ fn parse_account_auth_statuses(log: &CommandExecutionDto) -> HashMap<String, Acc
     }
 
     statuses
+}
+
+fn normalize_account_status_key(value: &str) -> String {
+    value
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+        .to_lowercase()
 }
 
 fn parse_debug_status_tail(tail: &str) -> (Option<i32>, Option<String>) {
@@ -1843,6 +1905,35 @@ fn clean_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+fn trimmed_optional_str(value: Option<&str>) -> Option<&str> {
+    let trimmed = value?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn append_stdout_line(stdout: &mut String, line: &str) {
+    if !stdout.is_empty() {
+        stdout.push('\n');
+    }
+    stdout.push_str(line);
+}
+
+fn account_display_summary(account: &AccountDto) -> String {
+    let name = if !account.alias.trim().is_empty() {
+        Some(account.alias.as_str())
+    } else {
+        trimmed_optional_str(account.account_name.as_deref())
+    };
+
+    match name {
+        Some(name) => format!("{} | {}", account.email, name),
+        None => account.email.clone(),
+    }
+}
+
 fn display_command(display_path: &str, args: &[String]) -> String {
     if args.is_empty() {
         display_path.to_string()
@@ -1931,7 +2022,7 @@ mod tests {
             exit_code: Some(0),
             success: true,
             timed_out: false,
-            stdout: "[debug] response usage: 18780858059@163.com status=401 result=http-response\n[debug] response usage: melissamontgomery6442@hotmail.com status=200 result=usage-windows".to_string(),
+            stdout: "[debug] response usage: 18780858059@163.com status=401 result=http-response\n[debug] response usage: melissamontgomery6442@hotmail.com status=200 result=usage-windows\n[debug] response usage: tracycox8658@hotmail.com | LizzieDibberttm status=401 result=http-response".to_string(),
             stderr: String::new(),
         };
 
@@ -1949,6 +2040,96 @@ mod tests {
                 .map(|value| value.state.as_str()),
             Some("ok")
         );
+        assert_eq!(
+            statuses
+                .get("tracycox8658@hotmail.com | lizziedibberttm")
+                .map(|value| value.state.as_str()),
+            Some("invalid")
+        );
+    }
+
+    #[test]
+    fn auth_status_lookup_uses_workspace_name_for_duplicate_email() {
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            "tracycox8658@hotmail.com | lizziedibberttm".to_string(),
+            AccountAuthStatus {
+                state: "invalid".to_string(),
+                status_code: Some(401),
+                detail: Some("HTTP 401 (http-response)".to_string()),
+                checked_at_ms: 1,
+            },
+        );
+
+        let lizzie = RegistryAccount {
+            account_key: "key-lizzie".to_string(),
+            chatgpt_account_id: Some("account-lizzie".to_string()),
+            chatgpt_user_id: Some("user-tracy".to_string()),
+            email: "tracycox8658@hotmail.com".to_string(),
+            alias: None,
+            account_name: Some("LizzieDibberttm".to_string()),
+            plan: Some("team".to_string()),
+            auth_mode: Some("chatgpt".to_string()),
+            created_at: None,
+            last_used_at: None,
+            last_usage: None,
+            last_usage_at: None,
+            last_local_rollout: None,
+        };
+        let tingsky = RegistryAccount {
+            account_key: "key-tingsky".to_string(),
+            chatgpt_account_id: Some("account-tingsky".to_string()),
+            chatgpt_user_id: Some("user-tracy".to_string()),
+            email: "tracycox8658@hotmail.com".to_string(),
+            alias: None,
+            account_name: Some("Tingsky11".to_string()),
+            plan: Some("team".to_string()),
+            auth_mode: Some("chatgpt".to_string()),
+            created_at: None,
+            last_used_at: None,
+            last_usage: None,
+            last_usage_at: None,
+            last_local_rollout: None,
+        };
+        let counts = account_email_counts(&[lizzie, tingsky]);
+
+        let lizzie = RegistryAccount {
+            account_key: "key-lizzie".to_string(),
+            chatgpt_account_id: Some("account-lizzie".to_string()),
+            chatgpt_user_id: Some("user-tracy".to_string()),
+            email: "tracycox8658@hotmail.com".to_string(),
+            alias: None,
+            account_name: Some("LizzieDibberttm".to_string()),
+            plan: Some("team".to_string()),
+            auth_mode: Some("chatgpt".to_string()),
+            created_at: None,
+            last_used_at: None,
+            last_usage: None,
+            last_usage_at: None,
+            last_local_rollout: None,
+        };
+        let tingsky = RegistryAccount {
+            account_key: "key-tingsky".to_string(),
+            chatgpt_account_id: Some("account-tingsky".to_string()),
+            chatgpt_user_id: Some("user-tracy".to_string()),
+            email: "tracycox8658@hotmail.com".to_string(),
+            alias: None,
+            account_name: Some("Tingsky11".to_string()),
+            plan: Some("team".to_string()),
+            auth_mode: Some("chatgpt".to_string()),
+            created_at: None,
+            last_used_at: None,
+            last_usage: None,
+            last_usage_at: None,
+            last_local_rollout: None,
+        };
+
+        assert_eq!(
+            find_account_auth_status(&lizzie, &statuses, &counts)
+                .map(|status| status.state.as_str()),
+            Some("invalid")
+        );
+        assert!(find_account_auth_status(&tingsky, &statuses, &counts).is_none());
     }
 
     #[test]

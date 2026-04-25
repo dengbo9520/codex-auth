@@ -288,11 +288,15 @@ function isAccountInvalid(account: {
 }
 
 function getAccountStatusLabel(account: {
+  plan: string;
   active: boolean;
   authStatus: string;
   authStatusCode: number | null;
 }) {
   if (isAccountInvalid(account)) {
+    if (isWorkspaceAccount(account.plan)) {
+      return "停用";
+    }
     return "失效";
   }
   return account.active ? "激活" : "待命";
