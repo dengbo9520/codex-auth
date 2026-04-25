@@ -91,6 +91,8 @@ import { useRegistryEvents } from "@/hooks/use-registry-events";
 import { api } from "@/lib/api";
 import {
   fallbackText,
+  formatIsoRelative,
+  formatIsoTimestamp,
   formatPercent,
   formatRelative,
   formatShortTimestamp,
@@ -287,12 +289,42 @@ function isAccountInvalid(account: {
   return account.authStatus === "invalid" || account.authStatusCode === 401;
 }
 
+function isPaidPlan(plan: string | null | undefined) {
+  const normalized = plan?.trim().toLowerCase();
+  return (
+    normalized === "plus" ||
+    normalized === "pro" ||
+    normalized === "prolite" ||
+    normalized === "pro lite" ||
+    isWorkspaceAccount(normalized)
+  );
+}
+
+function isIsoExpired(value: string | null | undefined) {
+  if (!value) {
+    return false;
+  }
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) && timestamp <= Date.now();
+}
+
+function isSubscriptionExpired(account: {
+  plan: string;
+  subscriptionActiveUntil: string | null;
+}) {
+  return isPaidPlan(account.plan) && isIsoExpired(account.subscriptionActiveUntil);
+}
+
 function getAccountStatusLabel(account: {
   plan: string;
+  subscriptionActiveUntil: string | null;
   active: boolean;
   authStatus: string;
   authStatusCode: number | null;
 }) {
+  if (isSubscriptionExpired(account)) {
+    return "到期";
+  }
   if (isAccountInvalid(account)) {
     if (isWorkspaceAccount(account.plan)) {
       return "停用";
@@ -303,11 +335,13 @@ function getAccountStatusLabel(account: {
 }
 
 function getAccountStatusVariant(account: {
+  plan: string;
+  subscriptionActiveUntil: string | null;
   active: boolean;
   authStatus: string;
   authStatusCode: number | null;
 }) {
-  if (isAccountInvalid(account)) {
+  if (isSubscriptionExpired(account) || isAccountInvalid(account)) {
     return "destructive" as const;
   }
   return account.active ? ("default" as const) : ("outline" as const);
@@ -1404,6 +1438,7 @@ function AccountsPage({
                             {account.authStatusDetail}
                           </div>
                         ) : null}
+                        <AccountLifecycleDetail account={account} />
                       </div>
                     </TableCell>
                     <TableCell className="whitespace-normal align-top">
@@ -1505,6 +1540,50 @@ function UsageQuotaCell({
       ) : (
         <div className="text-sm text-muted-foreground">恢复：暂无</div>
       )}
+    </div>
+  );
+}
+
+function AccountLifecycleDetail({ account }: { account: AccountItem }) {
+  const subscriptionExpired = isSubscriptionExpired(account);
+  const loginExpired =
+    account.loginExpiresAtMs !== null && account.loginExpiresAtMs <= Date.now();
+
+  return (
+    <div className="space-y-1 text-xs text-muted-foreground">
+      {account.subscriptionActiveUntil ? (
+        <div className={subscriptionExpired ? "text-destructive" : undefined}>
+          套餐：
+          {subscriptionExpired ? "已到期，" : ""}
+          {formatIsoTimestamp(account.subscriptionActiveUntil)}
+        </div>
+      ) : null}
+      {account.subscriptionLastChecked ? (
+        <div>套餐检查：{formatIsoRelative(account.subscriptionLastChecked)}</div>
+      ) : null}
+      {account.loginExpiresAtMs ? (
+        <div
+          className={
+            loginExpired && !account.authHasRefreshToken
+              ? "text-destructive"
+              : undefined
+          }
+        >
+          ID 令牌：
+          {loginExpired
+            ? account.authHasRefreshToken
+              ? "已过期，可续期，"
+              : "已过期，"
+            : ""}
+          {formatTimestamp(account.loginExpiresAtMs)}
+        </div>
+      ) : null}
+      {account.authLastRefresh ? (
+        <div>最近刷新：{formatIsoRelative(account.authLastRefresh)}</div>
+      ) : null}
+      {!account.authHasRefreshToken ? (
+        <div className="text-destructive">缺少 refresh token，可能需要重新登录</div>
+      ) : null}
     </div>
   );
 }

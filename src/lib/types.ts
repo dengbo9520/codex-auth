@@ -30,6 +30,12 @@ export interface AccountDto {
   authStatusCode: number | null;
   authStatusDetail: string | null;
   authCheckedAtMs: number | null;
+  loginExpiresAtMs: number | null;
+  authLastRefresh: string | null;
+  authHasRefreshToken: boolean;
+  subscriptionActiveUntil: string | null;
+  subscriptionLastChecked: string | null;
+  subscriptionPlan: string | null;
   primaryUsage: UsageWindowDto | null;
   weeklyUsage: UsageWindowDto | null;
 }

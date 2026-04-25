@@ -204,6 +204,12 @@ pub struct AccountDto {
     pub auth_status_code: Option<i32>,
     pub auth_status_detail: Option<String>,
     pub auth_checked_at_ms: Option<i64>,
+    pub login_expires_at_ms: Option<i64>,
+    pub auth_last_refresh: Option<String>,
+    pub auth_has_refresh_token: bool,
+    pub subscription_active_until: Option<String>,
+    pub subscription_last_checked: Option<String>,
+    pub subscription_plan: Option<String>,
     pub primary_usage: Option<UsageWindowDto>,
     pub weekly_usage: Option<UsageWindowDto>,
 }
@@ -329,6 +335,16 @@ struct RegistryUsageWindow {
     used_percent: Option<i64>,
     window_minutes: Option<i64>,
     resets_at: Option<i64>,
+}
+
+#[derive(Default)]
+struct AccountAuthMetadata {
+    login_expires_at_ms: Option<i64>,
+    auth_last_refresh: Option<String>,
+    auth_has_refresh_token: bool,
+    subscription_active_until: Option<String>,
+    subscription_last_checked: Option<String>,
+    subscription_plan: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1056,6 +1072,7 @@ fn read_registry_snapshot(
         .into_iter()
         .map(|account| {
             registry_account_to_dto(
+                dirs,
                 account,
                 active_account_key.as_deref(),
                 account_auth_statuses,
@@ -1090,12 +1107,14 @@ fn read_registry_snapshot(
     }
 }
 fn registry_account_to_dto(
+    dirs: &InternalDirectories,
     account: RegistryAccount,
     active_account_key: Option<&str>,
     account_auth_statuses: &HashMap<String, AccountAuthStatus>,
     email_counts: &HashMap<String, usize>,
 ) -> AccountDto {
     let auth_status = find_account_auth_status(&account, account_auth_statuses, email_counts);
+    let auth_metadata = read_account_auth_metadata(dirs, &account.account_key);
     AccountDto {
         active: active_account_key
             .map(|key| key == account.account_key)
@@ -1118,6 +1137,12 @@ fn registry_account_to_dto(
         auth_status_code: auth_status.and_then(|status| status.status_code),
         auth_status_detail: auth_status.and_then(|status| status.detail.clone()),
         auth_checked_at_ms: auth_status.map(|status| status.checked_at_ms),
+        login_expires_at_ms: auth_metadata.login_expires_at_ms,
+        auth_last_refresh: auth_metadata.auth_last_refresh,
+        auth_has_refresh_token: auth_metadata.auth_has_refresh_token,
+        subscription_active_until: auth_metadata.subscription_active_until,
+        subscription_last_checked: auth_metadata.subscription_last_checked,
+        subscription_plan: auth_metadata.subscription_plan,
         primary_usage: account
             .last_usage
             .as_ref()
@@ -1171,6 +1196,117 @@ fn account_status_lookup_keys(account: &RegistryAccount) -> Vec<String> {
         ));
     }
     keys
+}
+
+fn read_account_auth_metadata(
+    dirs: &InternalDirectories,
+    account_key: &str,
+) -> AccountAuthMetadata {
+    let path = dirs.accounts_dir.join(format!(
+        "{}.auth.json",
+        base64url_encode(account_key.as_bytes())
+    ));
+    let file_contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(_) => return AccountAuthMetadata::default(),
+    };
+    let parsed = match serde_json::from_str::<serde_json::Value>(&file_contents) {
+        Ok(value) => value,
+        Err(_) => return AccountAuthMetadata::default(),
+    };
+    let tokens = parsed.get("tokens").unwrap_or(&serde_json::Value::Null);
+    let id_token = tokens
+        .get("id_token")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| parsed.get("id_token").and_then(serde_json::Value::as_str));
+    let claims = id_token.and_then(parse_jwt_payload);
+    let openai_auth = claims
+        .as_ref()
+        .and_then(|claims| claims.get("https://api.openai.com/auth"));
+
+    AccountAuthMetadata {
+        login_expires_at_ms: claims
+            .as_ref()
+            .and_then(|claims| claims.get("exp"))
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|seconds| seconds_to_ms(Some(seconds))),
+        auth_last_refresh: parsed
+            .get("last_refresh")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        auth_has_refresh_token: tokens
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+        subscription_active_until: openai_auth
+            .and_then(|auth| auth.get("chatgpt_subscription_active_until"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        subscription_last_checked: openai_auth
+            .and_then(|auth| auth.get("chatgpt_subscription_last_checked"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        subscription_plan: openai_auth
+            .and_then(|auth| auth.get("chatgpt_plan_type"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+fn parse_jwt_payload(token: &str) -> Option<serde_json::Value> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64url_decode(payload)?;
+    serde_json::from_slice::<serde_json::Value>(&decoded).ok()
+}
+
+fn base64url_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let b0 = bytes[index];
+        let b1 = bytes.get(index + 1).copied().unwrap_or(0);
+        let b2 = bytes.get(index + 2).copied().unwrap_or(0);
+        output.push(ALPHABET[(b0 >> 2) as usize] as char);
+        output.push(ALPHABET[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if index + 1 < bytes.len() {
+            output.push(ALPHABET[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        }
+        if index + 2 < bytes.len() {
+            output.push(ALPHABET[(b2 & 0b0011_1111) as usize] as char);
+        }
+        index += 3;
+    }
+    output
+}
+
+fn base64url_decode(value: &str) -> Option<Vec<u8>> {
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    let mut output = Vec::new();
+
+    for byte in value.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let decoded = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(decoded);
+        bits += 6;
+        while bits >= 8 {
+            bits -= 8;
+            output.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+
+    Some(output)
 }
 
 fn usage_window_to_dto(window: &RegistryUsageWindow) -> UsageWindowDto {
