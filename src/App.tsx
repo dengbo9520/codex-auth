@@ -1546,8 +1546,6 @@ function UsageQuotaCell({
 
 function AccountLifecycleDetail({ account }: { account: AccountItem }) {
   const subscriptionExpired = isSubscriptionExpired(account);
-  const loginExpired =
-    account.loginExpiresAtMs !== null && account.loginExpiresAtMs <= Date.now();
 
   return (
     <div className="space-y-1 text-xs text-muted-foreground">
@@ -1561,25 +1559,8 @@ function AccountLifecycleDetail({ account }: { account: AccountItem }) {
       {account.subscriptionLastChecked ? (
         <div>套餐检查：{formatIsoRelative(account.subscriptionLastChecked)}</div>
       ) : null}
-      {account.loginExpiresAtMs ? (
-        <div
-          className={
-            loginExpired && !account.authHasRefreshToken
-              ? "text-destructive"
-              : undefined
-          }
-        >
-          ID 令牌：
-          {loginExpired
-            ? account.authHasRefreshToken
-              ? "已过期，可续期，"
-              : "已过期，"
-            : ""}
-          {formatTimestamp(account.loginExpiresAtMs)}
-        </div>
-      ) : null}
       {account.authLastRefresh ? (
-        <div>最近刷新：{formatIsoRelative(account.authLastRefresh)}</div>
+        <div>登录凭据刷新：{formatIsoRelative(account.authLastRefresh)}</div>
       ) : null}
       {!account.authHasRefreshToken ? (
         <div className="text-destructive">缺少 refresh token，可能需要重新登录</div>
