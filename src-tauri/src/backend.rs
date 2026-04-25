@@ -259,6 +259,18 @@ pub struct MutationResultDto {
     pub registry: RegistrySnapshotDto,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountVerificationDto {
+    pub command: CommandExecutionDto,
+    pub registry: RegistrySnapshotDto,
+    pub account_key: String,
+    pub state: String,
+    pub label: String,
+    pub detail: String,
+    pub switched_back: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandExecutionDto {
@@ -641,6 +653,106 @@ pub fn switch_account(query: String, state: State<'_, AppState>) -> MutationResu
     }
     state.push_log(command.clone());
     MutationResultDto { command, registry }
+}
+
+#[tauri::command]
+pub fn verify_account_state(
+    account_key: String,
+    state: State<'_, AppState>,
+) -> AccountVerificationDto {
+    let target_key = account_key.trim().to_string();
+    let before_registry = read_registry_snapshot(&state.dirs, &HashMap::new());
+    let previous_key = before_registry.active_account_key.clone();
+    let previous_query = previous_key
+        .as_ref()
+        .and_then(|key| resolve_account_selector(&state.dirs, key, "switch").ok())
+        .map(|selector| selector.query);
+
+    let selector = resolve_account_selector(&state.dirs, &target_key, "switch");
+    let mut command = match selector {
+        Ok(selector) => run_query_command(&state, "switch", "verify-account", selector.query),
+        Err(error) => CommandExecutionDto::synthetic(
+            "verify-account",
+            "codex-auth",
+            "verify account",
+            vec!["verify-account".to_string(), target_key.clone()],
+            &state.dirs.codex_root,
+            false,
+            String::new(),
+            error,
+        ),
+    };
+
+    let after_switch_registry = read_registry_snapshot(&state.dirs, &HashMap::new());
+    let active_matches = after_switch_registry.active_account_key.as_deref() == Some(&target_key);
+    let mut switched_back = false;
+
+    if previous_key.as_deref() != Some(&target_key) {
+        if let Some(query) = previous_query {
+            let restore_command = run_query_command(&state, "switch", "verify-restore", query);
+            switched_back = restore_command.success;
+            append_stdout_line(
+                &mut command.stdout,
+                format!("restore previous active account: success={}", restore_command.success)
+                    .as_str(),
+            );
+            state.push_log(restore_command);
+        }
+    } else {
+        switched_back = true;
+    }
+
+    let registry = read_registry_snapshot(&state.dirs, &HashMap::new());
+    let (state_label, label, detail) = if !command.success {
+        (
+            "verify_failed".to_string(),
+            "验证失败".to_string(),
+            command.stderr.clone(),
+        )
+    } else if active_matches {
+        (
+            "switchable".to_string(),
+            "可切换".to_string(),
+            "codex-auth 可以切到该账号/空间；不能仅凭 usage API 401 判定停用。".to_string(),
+        )
+    } else {
+        let active_summary = after_switch_registry
+            .accounts
+            .iter()
+            .find(|account| account.active)
+            .map(|account| {
+                format!(
+                    "{} / {}",
+                    account.email,
+                    account
+                        .account_name
+                        .clone()
+                        .unwrap_or_else(|| account.plan.clone())
+                )
+            })
+            .unwrap_or_else(|| "无激活账号".to_string());
+        (
+            "suspected_disabled".to_string(),
+            "疑似停用".to_string(),
+            format!("请求切换后实际激活为 {active_summary}，目标未成为 active。"),
+        )
+    };
+
+    append_stdout_line(
+        &mut command.stdout,
+        format!("verification: {label}; switched_back={switched_back}").as_str(),
+    );
+    state.push_log(command.clone());
+
+    AccountVerificationDto {
+        command,
+        registry,
+        account_key: target_key,
+        state: state_label,
+        label,
+        detail,
+        switched_back,
+    }
 }
 
 #[tauri::command]

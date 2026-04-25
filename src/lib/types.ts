@@ -125,6 +125,16 @@ export interface MutationResultDto {
   registry: RegistrySnapshotDto;
 }
 
+export interface AccountVerificationDto {
+  command: CommandExecutionDto;
+  registry: RegistrySnapshotDto;
+  accountKey: string;
+  state: string;
+  label: string;
+  detail: string;
+  switchedBack: boolean;
+}
+
 export interface RegistryChangedEventDto {
   kind: string;
   paths: string[];

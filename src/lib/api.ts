@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   AppSnapshotDto,
+  AccountVerificationDto,
   CommandExecutionDto,
   MutationResultDto,
 } from "@/lib/types";
@@ -21,6 +22,9 @@ export const api = {
   },
   switchAccount(query: string) {
     return invoke<MutationResultDto>("switch_account", { query });
+  },
+  verifyAccountState(accountKey: string) {
+    return invoke<AccountVerificationDto>("verify_account_state", { accountKey });
   },
   removeAccount(query: string) {
     return invoke<MutationResultDto>("remove_account", { query });

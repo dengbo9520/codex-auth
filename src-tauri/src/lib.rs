@@ -24,6 +24,7 @@ pub fn run() {
             backend::run_codex_auth_status,
             backend::refresh_registry_snapshot,
             backend::switch_account,
+            backend::verify_account_state,
             backend::remove_account,
             backend::set_account_alias,
             backend::import_auth_file,

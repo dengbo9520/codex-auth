@@ -99,6 +99,7 @@ import {
   formatTimestamp,
 } from "@/lib/format";
 import type {
+  AccountVerificationDto,
   AppSnapshotDto,
   CommandExecutionDto,
   MutationResultDto,
@@ -185,10 +186,11 @@ type AppAction =
   | { kind: "rebuildRegistry"; path?: string }
   | { kind: "autoSwitch"; enabled: boolean }
   | { kind: "usageApi"; enabled: boolean }
+  | { kind: "verifyAccount"; accountKey: string }
   | { kind: "launchLogin"; deviceAuth: boolean }
   | { kind: "openPath"; target: string };
 
-type ActionResult = MutationResultDto | CommandExecutionDto;
+type ActionResult = MutationResultDto | CommandExecutionDto | AccountVerificationDto;
 
 function isMutationResult(value: ActionResult): value is MutationResultDto {
   return "registry" in value;
@@ -196,6 +198,12 @@ function isMutationResult(value: ActionResult): value is MutationResultDto {
 
 function commandFromResult(result: ActionResult) {
   return isMutationResult(result) ? result.command : result;
+}
+
+function isAccountVerificationResult(
+  value: ActionResult,
+): value is AccountVerificationDto {
+  return "label" in value && "detail" in value && "switchedBack" in value;
 }
 
 function pickQuery(account: AccountItem) {
@@ -617,6 +625,8 @@ export default function App() {
           return api.setAutoSwitch(action.enabled);
         case "usageApi":
           return api.setUsageApiMode(action.enabled);
+        case "verifyAccount":
+          return api.verifyAccountState(action.accountKey);
         case "launchLogin":
           return api.launchLogin(action.deviceAuth);
         case "openPath":
@@ -747,6 +757,29 @@ export default function App() {
     );
     if (!commandFromResult(result).success) {
       suppressNextActiveChangeToastRef.current = false;
+    }
+  }
+
+  async function handleVerifyAccount(account: AccountItem) {
+    await logUiEvent("verify-account-click", {
+      email: account.email,
+      accountKey: account.accountKey,
+      accountName: account.accountName,
+      authStatus: account.authStatus,
+      authStatusCode: account.authStatusCode,
+    });
+    const result = await runAction(
+      { kind: "verifyAccount", accountKey: account.accountKey },
+      "状态验证完成",
+      {
+        refreshStatus: true,
+        restartHint: true,
+      },
+    );
+    if (isAccountVerificationResult(result)) {
+      toast.info(result.label, {
+        description: result.detail,
+      });
     }
   }
 
@@ -1352,6 +1385,7 @@ export default function App() {
                     pendingAction={pendingAction}
                     onSearchChange={setAccountsSearch}
                     onSwitch={handleSwitchAccount}
+                    onVerify={handleVerifyAccount}
                     onRemove={handleRemoveAccount}
                     onRelogin={handleReloginAccount}
                     onSetAlias={handleSetAlias}
@@ -1559,6 +1593,7 @@ function AccountsPage({
   pendingAction,
   onSearchChange,
   onSwitch,
+  onVerify,
   onRemove,
   onRelogin,
   onSetAlias,
@@ -1570,6 +1605,7 @@ function AccountsPage({
   pendingAction: AppAction | null;
   onSearchChange: (value: string) => void;
   onSwitch: (query: string) => Promise<void>;
+  onVerify: (account: AccountItem) => Promise<void>;
   onRemove: (account: AccountItem) => Promise<void>;
   onRelogin: (account: AccountItem) => Promise<void>;
   onSetAlias: (account: AccountItem) => Promise<void>;
@@ -1627,6 +1663,9 @@ function AccountsPage({
                   pendingAction.query === account.accountKey;
                 const aliasBusy =
                   pendingAction?.kind === "setAlias" &&
+                  pendingAction.accountKey === account.accountKey;
+                const verifyBusy =
+                  pendingAction?.kind === "verifyAccount" &&
                   pendingAction.accountKey === account.accountKey;
                 const reloginBusy =
                   pendingAction?.kind === "launchLogin" && isAccountInvalid(account);
@@ -1695,13 +1734,29 @@ function AccountsPage({
                         <Button
                           variant="outline"
                           size="sm"
-                          disabled={account.active || isAccountInvalid(account) || switchBusy}
+                          disabled={
+                            account.active ||
+                            isAccountInvalid(account) ||
+                            switchBusy ||
+                            verifyBusy
+                          }
                           onClick={() => void onSwitch(pickQuery(account))}
                         >
                           {switchBusy ? (
                             <Loader2Icon className="mr-1 animate-spin" />
                           ) : null}
                           切换
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={verifyBusy || switchBusy}
+                          onClick={() => void onVerify(account)}
+                        >
+                          {verifyBusy ? (
+                            <Loader2Icon className="mr-1 animate-spin" />
+                          ) : null}
+                          验证
                         </Button>
                         {isAccountInvalid(account) ? (
                           <Button
