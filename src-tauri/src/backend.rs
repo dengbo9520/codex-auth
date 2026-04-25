@@ -98,6 +98,7 @@ pub(crate) struct InternalDirectories {
     registry_path: PathBuf,
     app_log_dir: PathBuf,
     app_log_file: PathBuf,
+    verification_cache_file: PathBuf,
 }
 
 impl InternalDirectories {
@@ -113,6 +114,7 @@ impl InternalDirectories {
             .unwrap_or_else(|_| codex_root.join("gui-cache"));
         let _ = fs::create_dir_all(&app_log_dir);
         let app_log_file = app_log_dir.join("command-history.json");
+        let verification_cache_file = app_log_dir.join("verification-cache.json");
 
         Self {
             codex_root,
@@ -121,6 +123,7 @@ impl InternalDirectories {
             registry_path,
             app_log_dir,
             app_log_file,
+            verification_cache_file,
         }
     }
 
@@ -343,7 +346,6 @@ struct RegistryFile {
     auto_switch: RegistryAutoSwitch,
     api: RegistryApi,
     accounts: Vec<RegistryAccount>,
-    gui_status_checks: HashMap<String, RegistryStatusCheck>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -359,7 +361,7 @@ struct RegistryApi {
     account: bool,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
 #[serde(default)]
 struct RegistryStatusCheck {
     state: Option<String>,
@@ -764,9 +766,9 @@ pub fn verify_account_state(
     );
 
     match write_account_verification(&state.dirs, &target_key, &state_label, &label, &detail) {
-        Ok(backup_path) => append_stdout_line(
+        Ok(cache_path) => append_stdout_line(
             &mut command.stdout,
-            format!("cached verification in registry.json; backup={backup_path}").as_str(),
+            format!("cached verification: {cache_path}").as_str(),
         ),
         Err(error) => append_stdout_line(
             &mut command.stdout,
@@ -1385,7 +1387,7 @@ fn read_registry_snapshot(
 
     let email_counts = account_email_counts(&parsed.accounts);
     let active_account_key = parsed.active_account_key.clone();
-    let gui_status_checks = parsed.gui_status_checks;
+    let gui_status_checks = load_account_verifications(&dirs.verification_cache_file);
     let mut accounts = parsed
         .accounts
         .into_iter()
@@ -2135,29 +2137,41 @@ fn write_account_verification(
     label: &str,
     detail: &str,
 ) -> Result<String, String> {
-    let mut parsed = read_registry_json(dirs, "account verification")?;
-    let root = parsed
-        .as_object_mut()
-        .ok_or_else(|| "registry root is not a JSON object.".to_string())?;
-    let checks = root
-        .entry("gui_status_checks".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| "registry field 'gui_status_checks' is not a JSON object.".to_string())?;
-
+    let mut checks = load_account_verifications(&dirs.verification_cache_file);
     checks.insert(
         account_key.to_string(),
-        serde_json::json!({
-            "state": state,
-            "label": label,
-            "detail": detail,
-            "checked_at_ms": now_ms()
-        }),
+        RegistryStatusCheck {
+            state: Some(state.to_string()),
+            label: Some(label.to_string()),
+            detail: Some(detail.to_string()),
+            checked_at_ms: Some(now_ms()),
+        },
     );
 
-    let backup_path = backup_registry(dirs, "verify")?;
-    write_registry_json(dirs, &parsed, "account verification")?;
-    Ok(path_string(&backup_path))
+    fs::create_dir_all(&dirs.app_log_dir).map_err(|error| {
+        format!(
+            "Failed to create verification cache dir: {} ({error})",
+            dirs.app_log_dir.display()
+        )
+    })?;
+    let serialized = serde_json::to_string_pretty(&checks)
+        .map_err(|error| format!("Failed to serialize verification cache: {error}"))?;
+    fs::write(&dirs.verification_cache_file, format!("{serialized}\n")).map_err(|error| {
+        format!(
+            "Failed to write verification cache: {} ({error})",
+            dirs.verification_cache_file.display()
+        )
+    })?;
+    Ok(path_string(&dirs.verification_cache_file))
+}
+
+fn load_account_verifications(path: &Path) -> HashMap<String, RegistryStatusCheck> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| {
+            serde_json::from_str::<HashMap<String, RegistryStatusCheck>>(&contents).ok()
+        })
+        .unwrap_or_default()
 }
 
 fn backup_registry(dirs: &InternalDirectories, label: &str) -> Result<PathBuf, String> {
@@ -2804,6 +2818,7 @@ mod tests {
             registry_path: registry_path.clone(),
             app_log_dir: app_log_dir.clone(),
             app_log_file: app_log_dir.join("command-history.json"),
+            verification_cache_file: app_log_dir.join("verification-cache.json"),
         };
 
         let backup_path = write_account_alias(&dirs, "key-2", "melissa-plus").expect("set alias");
