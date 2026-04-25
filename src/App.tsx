@@ -887,13 +887,16 @@ export default function App() {
   }
 
   async function handleToggleAutoSwitch(enabled: boolean) {
-    await runAction(
+    const result = await runAction(
       { kind: "autoSwitch", enabled },
       enabled ? "已开启自动切换" : "已关闭自动切换",
       {
         refreshStatus: true,
       },
     );
+    if (enabled && isMutationResult(result) && result.command.success) {
+      await maybeRunGuiAutoSwitch(result.registry);
+    }
   }
 
   async function handleToggleUsageApi(enabled: boolean) {
