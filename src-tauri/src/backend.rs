@@ -28,6 +28,7 @@ static COMMAND_COUNTER: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub struct AppState {
     logs: Arc<Mutex<VecDeque<CommandExecutionDto>>>,
+    performance: Arc<Mutex<VecDeque<PerformanceSpanDto>>>,
     pub(crate) dirs: InternalDirectories,
 }
 
@@ -37,6 +38,7 @@ impl AppState {
         let logs = load_logs(&dirs.app_log_file);
         Self {
             logs: Arc::new(Mutex::new(logs)),
+            performance: Arc::new(Mutex::new(VecDeque::new())),
             dirs,
         }
     }
@@ -56,6 +58,32 @@ impl AppState {
         self.logs
             .lock()
             .expect("command log lock poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn push_perf(&self, label: &str, duration_ms: i64, detail: impl Into<String>) {
+        let mut guard = self
+            .performance
+            .lock()
+            .expect("performance log lock poisoned");
+        guard.push_front(PerformanceSpanDto {
+            label: label.to_string(),
+            duration_ms,
+            detail: detail.into(),
+            timestamp_ms: now_ms(),
+        });
+
+        while guard.len() > COMMAND_LOG_LIMIT {
+            guard.pop_back();
+        }
+    }
+
+    fn recent_performance(&self) -> Vec<PerformanceSpanDto> {
+        self.performance
+            .lock()
+            .expect("performance log lock poisoned")
             .iter()
             .cloned()
             .collect()
@@ -151,6 +179,7 @@ pub struct DiagnosticsSnapshotDto {
     pub directories: DirectorySetDto,
     pub recent_logs: Vec<CommandExecutionDto>,
     pub latest_status_log: Option<CommandExecutionDto>,
+    pub performance: Vec<PerformanceSpanDto>,
 }
 
 #[derive(Clone, Serialize)]
@@ -173,6 +202,15 @@ pub struct EnvCheckDto {
     pub path: Option<String>,
     pub version: Option<String>,
     pub message: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformanceSpanDto {
+    pub label: String,
+    pub duration_ms: i64,
+    pub detail: String,
+    pub timestamp_ms: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -457,15 +495,45 @@ pub async fn refresh_registry_snapshot(
     let fallback_state = state.clone();
 
     match tauri::async_runtime::spawn_blocking(move || {
+        let total_started_at_ms = now_ms();
         let command = run_codex_auth_command(
             &state,
             &["list", "--debug"],
             "refresh-registry",
             REFRESH_TIMEOUT_MS,
         );
+        state.push_perf(
+            "refresh.cli",
+            command.duration_ms,
+            format!(
+                "{} success={} timeout={}",
+                command.display_command, command.success, command.timed_out
+            ),
+        );
         state.push_log(command.clone());
+        let status_started_at_ms = now_ms();
         let account_auth_statuses = extract_account_auth_statuses(&state.recent_logs());
+        state.push_perf(
+            "refresh.status-parse",
+            now_ms() - status_started_at_ms,
+            format!("{} status entries", account_auth_statuses.len()),
+        );
+        let registry_started_at_ms = now_ms();
         let registry = read_registry_snapshot(&state.dirs, &account_auth_statuses);
+        state.push_perf(
+            "refresh.registry-read",
+            now_ms() - registry_started_at_ms,
+            format!("{} accounts", registry.accounts.len()),
+        );
+        state.push_perf(
+            "refresh.total",
+            now_ms() - total_started_at_ms,
+            format!(
+                "{} accounts, {} warnings",
+                registry.accounts.len(),
+                registry.warnings.len()
+            ),
+        );
         MutationResultDto { command, registry }
     })
     .await
@@ -709,13 +777,40 @@ pub fn rebuild_registry(path: Option<String>, state: State<'_, AppState>) -> Mut
 
 #[tauri::command]
 pub fn set_auto_switch(enabled: bool, state: State<'_, AppState>) -> MutationResultDto {
-    let action = if enabled { "enable" } else { "disable" };
-    let command = run_codex_auth_command(
-        &state,
-        &["config", "auto", action],
-        "config-auto",
-        CLI_TIMEOUT_MS,
-    );
+    let command = match write_auto_switch_enabled(&state.dirs, enabled) {
+        Ok(backup_path) => CommandExecutionDto::synthetic(
+            "config-auto",
+            "registry.json",
+            "set GUI auto-switch",
+            vec![
+                "config".to_string(),
+                "auto".to_string(),
+                if enabled { "enable" } else { "disable" }.to_string(),
+            ],
+            &state.dirs.codex_root,
+            true,
+            format!(
+                "GUI auto-switch set to {}. Backup: {}",
+                if enabled { "enabled" } else { "disabled" },
+                backup_path
+            ),
+            String::new(),
+        ),
+        Err(error) => CommandExecutionDto::synthetic(
+            "config-auto",
+            "registry.json",
+            "set GUI auto-switch",
+            vec![
+                "config".to_string(),
+                "auto".to_string(),
+                if enabled { "enable" } else { "disable" }.to_string(),
+            ],
+            &state.dirs.codex_root,
+            false,
+            String::new(),
+            error,
+        ),
+    };
     let registry = read_registry_snapshot(&state.dirs, &HashMap::new());
     state.push_log(command.clone());
     MutationResultDto { command, registry }
@@ -723,13 +818,40 @@ pub fn set_auto_switch(enabled: bool, state: State<'_, AppState>) -> MutationRes
 
 #[tauri::command]
 pub fn set_usage_api_mode(enabled: bool, state: State<'_, AppState>) -> MutationResultDto {
-    let action = if enabled { "enable" } else { "disable" };
-    let command = run_codex_auth_command(
-        &state,
-        &["config", "api", action],
-        "config-api",
-        CLI_TIMEOUT_MS,
-    );
+    let command = match write_usage_api_enabled(&state.dirs, enabled) {
+        Ok(backup_path) => CommandExecutionDto::synthetic(
+            "config-api",
+            "registry.json",
+            "set usage API mode",
+            vec![
+                "config".to_string(),
+                "api".to_string(),
+                if enabled { "enable" } else { "disable" }.to_string(),
+            ],
+            &state.dirs.codex_root,
+            true,
+            format!(
+                "Usage API mode set to {}. Backup: {}",
+                if enabled { "enabled" } else { "disabled" },
+                backup_path
+            ),
+            String::new(),
+        ),
+        Err(error) => CommandExecutionDto::synthetic(
+            "config-api",
+            "registry.json",
+            "set usage API mode",
+            vec![
+                "config".to_string(),
+                "api".to_string(),
+                if enabled { "enable" } else { "disable" }.to_string(),
+            ],
+            &state.dirs.codex_root,
+            false,
+            String::new(),
+            error,
+        ),
+    };
     let registry = read_registry_snapshot(&state.dirs, &HashMap::new());
     state.push_log(command.clone());
     MutationResultDto { command, registry }
@@ -974,6 +1096,7 @@ fn build_app_snapshot(state: &AppState) -> AppSnapshotDto {
         directories: state.dirs.dto(),
         recent_logs,
         latest_status_log,
+        performance: state.recent_performance(),
     };
 
     AppSnapshotDto {
@@ -1727,6 +1850,119 @@ fn write_account_alias(
     })?;
 
     Ok(path_string(&backup_path))
+}
+
+fn write_auto_switch_enabled(dirs: &InternalDirectories, enabled: bool) -> Result<String, String> {
+    write_registry_bool(
+        dirs,
+        &["auto_switch", "enabled"],
+        enabled,
+        "auto switch",
+        "auto",
+    )
+}
+
+fn write_usage_api_enabled(dirs: &InternalDirectories, enabled: bool) -> Result<String, String> {
+    write_registry_bools(
+        dirs,
+        &[(&["api", "usage"][..], enabled), (&["api", "account"][..], enabled)],
+        "usage API",
+        "api",
+    )
+}
+
+fn write_registry_bool(
+    dirs: &InternalDirectories,
+    path: &[&str],
+    enabled: bool,
+    label: &str,
+    backup_label: &str,
+) -> Result<String, String> {
+    write_registry_bools(dirs, &[(path, enabled)], label, backup_label)
+}
+
+fn write_registry_bools(
+    dirs: &InternalDirectories,
+    updates: &[(&[&str], bool)],
+    label: &str,
+    backup_label: &str,
+) -> Result<String, String> {
+    let mut parsed = read_registry_json(dirs, label)?;
+    for (path, enabled) in updates {
+        set_json_bool_path(&mut parsed, path, *enabled)?;
+    }
+    let backup_path = backup_registry(dirs, backup_label)?;
+    write_registry_json(dirs, &parsed, label)?;
+    Ok(path_string(&backup_path))
+}
+
+fn read_registry_json(
+    dirs: &InternalDirectories,
+    label: &str,
+) -> Result<serde_json::Value, String> {
+    let file_contents = fs::read_to_string(&dirs.registry_path).map_err(|error| {
+        format!(
+            "Failed to read registry before setting {label}: {} ({error})",
+            dirs.registry_path.display()
+        )
+    })?;
+    serde_json::from_str::<serde_json::Value>(&file_contents).map_err(|error| {
+        format!(
+            "Failed to parse registry before setting {label}: {} ({error})",
+            dirs.registry_path.display()
+        )
+    })
+}
+
+fn set_json_bool_path(
+    root: &mut serde_json::Value,
+    path: &[&str],
+    enabled: bool,
+) -> Result<(), String> {
+    let Some((leaf, parents)) = path.split_last() else {
+        return Err("registry bool path is empty.".to_string());
+    };
+    let mut current = root
+        .as_object_mut()
+        .ok_or_else(|| "registry root is not a JSON object.".to_string())?;
+    for segment in parents {
+        let value = current
+            .entry((*segment).to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        current = value
+            .as_object_mut()
+            .ok_or_else(|| format!("registry field '{segment}' is not a JSON object."))?;
+    }
+    current.insert((*leaf).to_string(), serde_json::Value::Bool(enabled));
+    Ok(())
+}
+
+fn backup_registry(dirs: &InternalDirectories, label: &str) -> Result<PathBuf, String> {
+    let backup_path = dirs
+        .registry_path
+        .with_file_name(format!("registry.json.bak.{label}.{}", now_ms()));
+    fs::copy(&dirs.registry_path, &backup_path).map_err(|error| {
+        format!(
+            "Failed to backup registry before setting {label}: {} ({error})",
+            backup_path.display()
+        )
+    })?;
+    Ok(backup_path)
+}
+
+fn write_registry_json(
+    dirs: &InternalDirectories,
+    parsed: &serde_json::Value,
+    label: &str,
+) -> Result<(), String> {
+    let serialized = serde_json::to_string_pretty(parsed)
+        .map_err(|error| format!("Failed to serialize registry after setting {label}: {error}"))?;
+    fs::write(&dirs.registry_path, format!("{serialized}\n")).map_err(|error| {
+        format!(
+            "Failed to write registry after setting {label}: {} ({error})",
+            dirs.registry_path.display()
+        )
+    })
 }
 
 fn run_codex_auth_command(

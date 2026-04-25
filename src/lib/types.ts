@@ -62,6 +62,13 @@ export interface EnvCheckDto {
   message: string;
 }
 
+export interface PerformanceSpanDto {
+  label: string;
+  durationMs: number;
+  detail: string;
+  timestampMs: number;
+}
+
 export interface DashboardSnapshotDto {
   activeAccount: AccountDto | null;
   remaining5hPercent: number | null;
@@ -104,6 +111,7 @@ export interface DiagnosticsSnapshotDto {
   directories: DirectorySetDto;
   recentLogs: CommandExecutionDto[];
   latestStatusLog: CommandExecutionDto | null;
+  performance: PerformanceSpanDto[];
 }
 
 export interface AppSnapshotDto {

@@ -171,6 +171,7 @@ const BACKGROUND_REFRESH_INTERVAL_MS = 60_000;
 const STARTUP_REFRESH_DELAY_MS = 2_500;
 const DIAGNOSTICS_STATUS_INTERVAL_MS = 30_000;
 const MIN_MANUAL_REFRESH_BUSY_MS = 800;
+const AUTO_SWITCH_RETRY_COOLDOWN_MS = 5 * 60_000;
 
 type AccountItem = AppSnapshotDto["registry"]["accounts"][number];
 
@@ -342,6 +343,75 @@ function isSubscriptionExpired(account: {
   return isPaidPlan(account.plan) && isIsoExpired(account.subscriptionActiveUntil);
 }
 
+function isUsageDepleted(usage: AccountItem["primaryUsage"] | null) {
+  return usage?.remainingPercent !== null && usage?.remainingPercent !== undefined
+    ? usage.remainingPercent <= 0
+    : false;
+}
+
+function hasKnownRemainingUsage(account: AccountItem) {
+  return (
+    (account.primaryUsage?.remainingPercent ?? null) !== null ||
+    (account.weeklyUsage?.remainingPercent ?? null) !== null
+  );
+}
+
+function isKnownUsableAccount(account: AccountItem) {
+  if (isAccountInvalid(account) || isSubscriptionExpired(account)) {
+    return false;
+  }
+  if (
+    isUsageDepleted(account.primaryUsage) ||
+    isUsageDepleted(account.weeklyUsage)
+  ) {
+    return false;
+  }
+  return hasKnownRemainingUsage(account);
+}
+
+function shouldAutoSwitchAccount(account: AccountItem | null | undefined) {
+  if (!account) {
+    return false;
+  }
+  return (
+    isAccountInvalid(account) ||
+    isSubscriptionExpired(account) ||
+    isUsageDepleted(account.primaryUsage) ||
+    isUsageDepleted(account.weeklyUsage)
+  );
+}
+
+function accountSwitchScore(account: AccountItem) {
+  const remainingValues = [
+    account.primaryUsage?.remainingPercent,
+    account.weeklyUsage?.remainingPercent,
+  ].filter((value): value is number => value !== null && value !== undefined);
+  const quotaScore = remainingValues.length ? Math.min(...remainingValues) : 0;
+  const lastUsed = account.lastUsedAtMs ?? account.lastUsageAtMs ?? 0;
+  return { quotaScore, lastUsed };
+}
+
+function pickGuiAutoSwitchTarget(accounts: AccountItem[]) {
+  const active = accounts.find((account) => account.active) ?? null;
+  if (!shouldAutoSwitchAccount(active)) {
+    return null;
+  }
+
+  const candidates = accounts
+    .filter((account) => !account.active && isKnownUsableAccount(account))
+    .sort((left, right) => {
+      const leftScore = accountSwitchScore(left);
+      const rightScore = accountSwitchScore(right);
+      return (
+        rightScore.quotaScore - leftScore.quotaScore ||
+        leftScore.lastUsed - rightScore.lastUsed ||
+        getAccountDisplayLabel(left).localeCompare(getAccountDisplayLabel(right))
+      );
+    });
+
+  return candidates[0] ?? null;
+}
+
 function getAccountStatusLabel(account: {
   plan: string;
   subscriptionActiveUntil: string | null;
@@ -458,6 +528,9 @@ export default function App() {
     { key: string | null; label: string } | undefined
   >(undefined);
   const suppressNextActiveChangeToastRef = useRef(false);
+  const lastGuiAutoSwitchAttemptRef = useRef<
+    { key: string; attemptedAtMs: number } | undefined
+  >(undefined);
   const deferredAccountsSearch = useDeferredValue(accountsSearch);
 
   useEffect(() => {
@@ -863,6 +936,9 @@ export default function App() {
         exitCode: result.command.exitCode,
         timedOut: result.command.timedOut,
         displayCommand: result.command.displayCommand,
+        commandDurationMs: result.command.durationMs,
+        totalDurationMs: Math.round(performance.now() - startedAt),
+        accountCount: result.registry.accounts.length,
         stderr: result.command.stderr,
       });
     } finally {
@@ -873,6 +949,60 @@ export default function App() {
       setManualRefreshPending(false);
       await logUiEvent("header-refresh-done", {
         durationMs: Math.round(performance.now() - startedAt),
+      });
+    }
+  }
+
+  async function maybeRunGuiAutoSwitch(registry: AppSnapshotDto["registry"]) {
+    if (!registry.autoSwitchEnabled) {
+      return;
+    }
+
+    const target = pickGuiAutoSwitchTarget(registry.accounts);
+    if (!target) {
+      return;
+    }
+
+    const now = Date.now();
+    const lastAttempt = lastGuiAutoSwitchAttemptRef.current;
+    if (
+      lastAttempt?.key === target.accountKey &&
+      now - lastAttempt.attemptedAtMs < AUTO_SWITCH_RETRY_COOLDOWN_MS
+    ) {
+      await logUiEvent("gui-auto-switch-skip", {
+        reason: "cooldown",
+        target: getAccountDisplayLabel(target),
+      });
+      return;
+    }
+
+    const active = registry.accounts.find((account) => account.active) ?? null;
+    lastGuiAutoSwitchAttemptRef.current = {
+      key: target.accountKey,
+      attemptedAtMs: now,
+    };
+    await logUiEvent("gui-auto-switch-start", {
+      from: active ? getAccountDisplayLabel(active) : null,
+      to: getAccountDisplayLabel(target),
+      targetAccountKey: target.accountKey,
+    });
+
+    const result = await api.switchAccount(target.accountKey);
+    await logUiEvent("gui-auto-switch-result", {
+      success: result.command.success,
+      exitCode: result.command.exitCode,
+      stderr: result.command.stderr,
+      stdout: result.command.stdout,
+    });
+
+    if (result.command.success) {
+      toast.success("自动切换已执行", {
+        description: `${getAccountDisplayLabel(active)} -> ${getAccountDisplayLabel(target)}`,
+      });
+      await refetchSnapshotAndStatus(page === "diagnostics");
+    } else {
+      toast.error("自动切换失败", {
+        description: buildActionError(result.command),
       });
     }
   }
@@ -925,8 +1055,14 @@ export default function App() {
         exitCode: result.command.exitCode,
         timedOut: result.command.timedOut,
         displayCommand: result.command.displayCommand,
+        commandDurationMs: result.command.durationMs,
+        totalDurationMs: Math.round(performance.now() - startedAt),
+        accountCount: result.registry.accounts.length,
         stderr: result.command.stderr,
       });
+      if (result.command.success) {
+        await maybeRunGuiAutoSwitch(result.registry);
+      }
     } finally {
       backgroundRefreshInFlightRef.current = false;
       setBackgroundRefreshPending(false);
@@ -1997,7 +2133,7 @@ function SettingsPage({
         <CardHeader>
           <CardTitle>自动切换</CardTitle>
           <CardDescription>
-            配额耗尽后，由 codex-auth 在后台切到下一个可用账号。
+            GUI 打开时检测配额与账号状态，耗尽后切到下一个可用账号。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -2021,7 +2157,7 @@ function SettingsPage({
             <InfoIcon />
             <AlertTitle>说明</AlertTitle>
             <AlertDescription>
-              只切账号，不切空间。切换成功后仍建议重启 Codex CLI / Codex App。
+              不使用 Windows 计划任务。GUI 关闭后不会自动切换。切换成功后仍建议重启 Codex CLI / Codex App。
             </AlertDescription>
           </Alert>
         </CardContent>
@@ -2167,6 +2303,15 @@ function DiagnosticsPage({
       value: snapshot.diagnostics.directories.appLogFile,
     },
   ] as const;
+  const latestRefreshTotal = snapshot.diagnostics.performance.find(
+    (item) => item.label === "refresh.total",
+  );
+  const latestRefreshCli = snapshot.diagnostics.performance.find(
+    (item) => item.label === "refresh.cli",
+  );
+  const latestRegistryRead = snapshot.diagnostics.performance.find(
+    (item) => item.label === "refresh.registry-read",
+  );
 
   return (
     <div className="space-y-6">
@@ -2237,6 +2382,67 @@ function DiagnosticsPage({
               </button>
             ))}
           </div>
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-3xl">
+        <CardHeader>
+          <CardTitle>刷新性能</CardTitle>
+          <CardDescription>
+            用来定位刷新卡顿。点右上角刷新后看这里的耗时。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-3 md:grid-cols-3">
+            <MetricCard
+              label="刷新总耗时"
+              value={
+                latestRefreshTotal ? `${latestRefreshTotal.durationMs} ms` : "暂无"
+              }
+              detail={latestRefreshTotal?.detail ?? "还没有刷新性能记录"}
+            />
+            <MetricCard
+              label="CLI 耗时"
+              value={latestRefreshCli ? `${latestRefreshCli.durationMs} ms` : "暂无"}
+              detail={latestRefreshCli?.detail ?? "`codex-auth list --debug`"}
+            />
+            <MetricCard
+              label="registry 读取"
+              value={
+                latestRegistryRead
+                  ? `${latestRegistryRead.durationMs} ms`
+                  : "暂无"
+              }
+              detail={latestRegistryRead?.detail ?? "解析 registry.json"}
+            />
+          </div>
+
+          {snapshot.diagnostics.performance.length ? (
+            <div className="overflow-hidden rounded-2xl border border-border/70">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>阶段</TableHead>
+                    <TableHead>耗时</TableHead>
+                    <TableHead>时间</TableHead>
+                    <TableHead>说明</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {snapshot.diagnostics.performance.slice(0, 12).map((item) => (
+                    <TableRow key={`${item.label}-${item.timestampMs}`}>
+                      <TableCell className="font-medium">{item.label}</TableCell>
+                      <TableCell>{item.durationMs} ms</TableCell>
+                      <TableCell>{formatTimestamp(item.timestampMs)}</TableCell>
+                      <TableCell className="break-all text-muted-foreground">
+                        {item.detail}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
