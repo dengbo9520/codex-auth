@@ -1,5 +1,5 @@
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -319,7 +319,22 @@ struct RegistryAccount {
     last_used_at: Option<i64>,
     last_usage: Option<RegistryUsage>,
     last_usage_at: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_last_local_rollout")]
     last_local_rollout: Option<i64>,
+}
+
+fn deserialize_last_local_rollout<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Number(number)) => number.as_i64(),
+        Some(serde_json::Value::Object(map)) => map
+            .get("event_timestamp_ms")
+            .and_then(serde_json::Value::as_i64),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2118,6 +2133,23 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_account_accepts_rollout_object() {
+        let account: RegistryAccount = serde_json::from_str(
+            r#"{
+                "account_key": "key",
+                "email": "user@example.com",
+                "last_local_rollout": {
+                    "path": "C:\\Users\\db\\.codex\\sessions\\rollout.jsonl",
+                    "event_timestamp_ms": 1777101637434
+                }
+            }"#,
+        )
+        .expect("parse registry account");
+
+        assert_eq!(account.last_local_rollout, Some(1777101637434));
+    }
 
     #[test]
     #[cfg(target_os = "windows")]
