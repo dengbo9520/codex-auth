@@ -226,7 +226,19 @@ function normalizeDialogSelection(value: string | string[] | null) {
 }
 
 function buildActionError(command: CommandExecutionDto) {
-  return command.stderr || command.stdout || "命令执行失败";
+  const output = command.stderr || command.stdout || "命令执行失败";
+  if (
+    command.category === "config-auto" &&
+    output.includes("Register-ScheduledTask") &&
+    output.includes("Access is denied")
+  ) {
+    return [
+      "自动切换后台服务启动失败：Windows 计划任务注册被拒绝。",
+      "需要用管理员权限运行 codex-auth config auto enable，或升级/修复 codex-auth 的计划任务安装权限。",
+      output,
+    ].join("\n\n");
+  }
+  return output;
 }
 
 function formatModeLabel(value: string | null | undefined) {
@@ -280,6 +292,21 @@ function getAccountSpaceLabel(
     return value;
   }
   return isWorkspaceAccount(account.plan) ? "未获取" : "个人账号";
+}
+
+function getAccountDisplayLabel(account: AccountItem | null | undefined) {
+  if (!account) {
+    return "无激活账号";
+  }
+  const alias = account.alias?.trim();
+  const space = account.accountName?.trim();
+  if (alias) {
+    return `${alias}（${account.email}）`;
+  }
+  if (space) {
+    return `${account.email} / ${space}`;
+  }
+  return account.email;
 }
 
 function isAccountInvalid(account: {
@@ -427,6 +454,10 @@ export default function App() {
   const [backgroundRefreshPending, setBackgroundRefreshPending] = useState(false);
   const backgroundRefreshInFlightRef = useRef(false);
   const bootstrapRefreshDoneRef = useRef(false);
+  const lastActiveAccountRef = useRef<
+    { key: string | null; label: string } | undefined
+  >(undefined);
+  const suppressNextActiveChangeToastRef = useRef(false);
   const deferredAccountsSearch = useDeferredValue(accountsSearch);
 
   useEffect(() => {
@@ -454,6 +485,37 @@ export default function App() {
         ? DIAGNOSTICS_STATUS_INTERVAL_MS
         : false,
   });
+
+  useEffect(() => {
+    const account = snapshotQuery.data?.dashboard.activeAccount ?? null;
+    const current = {
+      key: account?.accountKey ?? null,
+      label: getAccountDisplayLabel(account),
+    };
+    const previous = lastActiveAccountRef.current;
+
+    if (!previous) {
+      lastActiveAccountRef.current = current;
+      return;
+    }
+
+    if (previous.key !== current.key) {
+      if (suppressNextActiveChangeToastRef.current) {
+        suppressNextActiveChangeToastRef.current = false;
+      } else {
+        toast.info("当前账号已变化", {
+          description: `${previous.label} -> ${current.label}`,
+        });
+        void logUiEvent("active-account-changed", {
+          from: previous,
+          to: current,
+        });
+      }
+      lastActiveAccountRef.current = current;
+    } else if (previous.label !== current.label) {
+      lastActiveAccountRef.current = current;
+    }
+  }, [snapshotQuery.data?.dashboard.activeAccount]);
 
   const actionMutation = useMutation<ActionResult, Error, AppAction>({
     mutationFn: async (action) => {
@@ -583,7 +645,8 @@ export default function App() {
 
   async function handleSwitchAccount(query: string) {
     await logUiEvent("switch-click", { query });
-    await runAction(
+    suppressNextActiveChangeToastRef.current = true;
+    const result = await runAction(
       { kind: "switch", query },
       "账号已切换",
       {
@@ -591,6 +654,9 @@ export default function App() {
         restartHint: true,
       },
     );
+    if (!commandFromResult(result).success) {
+      suppressNextActiveChangeToastRef.current = false;
+    }
   }
 
   async function handleRemoveAccount(account: AccountItem) {
@@ -694,7 +760,6 @@ export default function App() {
       enabled ? "已开启自动切换" : "已关闭自动切换",
       {
         refreshStatus: true,
-        silentSuccess: true,
       },
     );
   }
