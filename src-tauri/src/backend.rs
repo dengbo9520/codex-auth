@@ -1543,7 +1543,7 @@ fn parse_account_auth_statuses(log: &CommandExecutionDto) -> HashMap<String, Acc
         let (status_code, detail) = parse_debug_status_tail(tail);
         let state = match status_code {
             Some(200) => "ok".to_string(),
-            Some(401) => "invalid".to_string(),
+            Some(401) => "usage_unauthorized".to_string(),
             Some(_) => "warning".to_string(),
             None => "unknown".to_string(),
         };
@@ -2457,7 +2457,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_account_auth_statuses_marks_401_invalid() {
+    fn parse_account_auth_statuses_marks_401_as_usage_unauthorized() {
         let log = CommandExecutionDto {
             id: "cmd-test".to_string(),
             category: "refresh-registry".to_string(),
@@ -2481,7 +2481,7 @@ mod tests {
             statuses
                 .get("18780858059@163.com")
                 .map(|value| value.state.as_str()),
-            Some("invalid")
+            Some("usage_unauthorized")
         );
         assert_eq!(
             statuses
@@ -2493,7 +2493,7 @@ mod tests {
             statuses
                 .get("tracycox8658@hotmail.com | lizziedibberttm")
                 .map(|value| value.state.as_str()),
-            Some("invalid")
+            Some("usage_unauthorized")
         );
     }
 

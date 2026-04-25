@@ -314,7 +314,7 @@ function isAccountInvalid(account: {
   authStatus: string;
   authStatusCode: number | null;
 }) {
-  return account.authStatus === "invalid" || account.authStatusCode === 401;
+  return account.authStatus === "invalid";
 }
 
 function isPaidPlan(plan: string | null | undefined) {
@@ -427,6 +427,12 @@ function getAccountStatusLabel(account: {
       return "停用";
     }
     return "失效";
+  }
+  if (account.authStatus === "usage_unauthorized") {
+    return "API 401";
+  }
+  if (account.authStatus === "warning") {
+    return "待验证";
   }
   return account.active ? "激活" : "待命";
 }
