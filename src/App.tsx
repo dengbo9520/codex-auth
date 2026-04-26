@@ -357,6 +357,25 @@ function isUsageDepleted(usage: AccountItem["primaryUsage"] | null) {
     : false;
 }
 
+function hasNoUsageCredits(account: AccountItem) {
+  return (
+    account.usageCreditsUnlimited === false &&
+    account.usageCreditsHasCredits === false &&
+    (account.usageCreditsBalance === "0" || account.usageCreditsBalance === null)
+  );
+}
+
+function isPrimaryUsageExhausted(account: AccountItem) {
+  const remaining = account.primaryUsage?.remainingPercent;
+  if (remaining === null || remaining === undefined) {
+    return false;
+  }
+  if (remaining <= 0) {
+    return true;
+  }
+  return remaining <= 1 && isPaidPlan(account.plan) && hasNoUsageCredits(account);
+}
+
 function hasKnownRemainingUsage(account: AccountItem) {
   return (
     (account.primaryUsage?.remainingPercent ?? null) !== null ||
@@ -369,7 +388,7 @@ function isKnownUsableAccount(account: AccountItem) {
     return false;
   }
   if (
-    isUsageDepleted(account.primaryUsage) ||
+    isPrimaryUsageExhausted(account) ||
     isUsageDepleted(account.weeklyUsage)
   ) {
     return false;
@@ -391,7 +410,7 @@ function shouldAutoSwitchAccount(account: AccountItem | null | undefined) {
   return (
     isAccountInvalid(account) ||
     isSubscriptionExpired(account) ||
-    isUsageDepleted(account.primaryUsage) ||
+    isPrimaryUsageExhausted(account) ||
     isUsageDepleted(account.weeklyUsage)
   );
 }
@@ -402,8 +421,15 @@ function accountSwitchScore(account: AccountItem) {
     account.weeklyUsage?.remainingPercent,
   ].filter((value): value is number => value !== null && value !== undefined);
   const quotaScore = remainingValues.length ? Math.min(...remainingValues) : 0;
-  const lastUsed = account.lastUsedAtMs ?? account.lastUsageAtMs ?? 0;
+  const lastUsed = getAccountRecentActivityMs(account) ?? 0;
   return { quotaScore, lastUsed };
+}
+
+function getAccountRecentActivityMs(account: AccountItem) {
+  const timestamps = [account.lastUsedAtMs, account.lastUsageAtMs].filter(
+    (value): value is number => typeof value === "number" && Number.isFinite(value),
+  );
+  return timestamps.length ? Math.max(...timestamps) : null;
 }
 
 function pickGuiAutoSwitchTarget(accounts: AccountItem[]) {
@@ -1566,12 +1592,8 @@ function DashboardPage({ snapshot }: { snapshot: AppSnapshotDto }) {
                 <div className="grid gap-3 md:grid-cols-3">
                   <MetricCard
                     label="最近活动"
-                    value={formatRelative(
-                      activeAccount.lastUsedAtMs ?? activeAccount.lastUsageAtMs,
-                    )}
-                    detail={formatTimestamp(
-                      activeAccount.lastUsedAtMs ?? activeAccount.lastUsageAtMs,
-                    )}
+                    value={formatRelative(getAccountRecentActivityMs(activeAccount))}
+                    detail={formatTimestamp(getAccountRecentActivityMs(activeAccount))}
                   />
                   <MetricCard
                     label="最近认证检查"
@@ -1743,15 +1765,18 @@ function AccountsPage({
                       {fallbackText(account.plan, "未知")}
                     </TableCell>
                     <TableCell className="whitespace-normal align-top">
-                      <UsageQuotaCell usage={account.primaryUsage} />
+                      <UsageQuotaCell
+                        usage={account.primaryUsage}
+                        exhausted={isPrimaryUsageExhausted(account)}
+                      />
                     </TableCell>
                     <TableCell className="whitespace-normal align-top">
                       <UsageQuotaCell usage={account.weeklyUsage} />
                     </TableCell>
                     <TableCell className="whitespace-normal align-top">
-                      <div>{formatRelative(account.lastUsedAtMs ?? account.lastUsageAtMs)}</div>
+                      <div>{formatRelative(getAccountRecentActivityMs(account))}</div>
                       <div className="text-sm text-muted-foreground">
-                        {formatTimestamp(account.lastUsedAtMs ?? account.lastUsageAtMs)}
+                        {formatTimestamp(getAccountRecentActivityMs(account))}
                       </div>
                     </TableCell>
                     <TableCell className="whitespace-normal align-top">
@@ -1875,14 +1900,16 @@ function AccountsPage({
 
 function UsageQuotaCell({
   usage,
+  exhausted = false,
 }: {
   usage: AccountItem["primaryUsage"] | null;
+  exhausted?: boolean;
 }) {
   const resetAtMs = usage?.resetsAtMs ?? null;
 
   return (
     <div className="space-y-1">
-      <div>{formatPercent(usage?.remainingPercent)}</div>
+      <div>{exhausted ? "0%" : formatPercent(usage?.remainingPercent)}</div>
       {resetAtMs ? (
         <>
           <div className="text-sm text-muted-foreground">

@@ -40,6 +40,9 @@ export interface AccountDto {
   verificationLabel: string | null;
   verificationDetail: string | null;
   verificationCheckedAtMs: number | null;
+  usageCreditsHasCredits: boolean | null;
+  usageCreditsUnlimited: boolean | null;
+  usageCreditsBalance: string | null;
   primaryUsage: UsageWindowDto | null;
   weeklyUsage: UsageWindowDto | null;
 }

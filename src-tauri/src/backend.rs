@@ -255,6 +255,9 @@ pub struct AccountDto {
     pub verification_label: Option<String>,
     pub verification_detail: Option<String>,
     pub verification_checked_at_ms: Option<i64>,
+    pub usage_credits_has_credits: Option<bool>,
+    pub usage_credits_unlimited: Option<bool>,
+    pub usage_credits_balance: Option<String>,
     pub primary_usage: Option<UsageWindowDto>,
     pub weekly_usage: Option<UsageWindowDto>,
 }
@@ -408,6 +411,15 @@ where
 struct RegistryUsage {
     primary: Option<RegistryUsageWindow>,
     secondary: Option<RegistryUsageWindow>,
+    credits: Option<RegistryUsageCredits>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RegistryUsageCredits {
+    has_credits: Option<bool>,
+    unlimited: Option<bool>,
+    balance: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1471,6 +1483,22 @@ fn registry_account_to_dto(
         verification_label: verification.and_then(|check| check.label.clone()),
         verification_detail: verification.and_then(|check| check.detail.clone()),
         verification_checked_at_ms: verification.and_then(|check| check.checked_at_ms),
+        usage_credits_has_credits: account
+            .last_usage
+            .as_ref()
+            .and_then(|usage| usage.credits.as_ref())
+            .and_then(|credits| credits.has_credits),
+        usage_credits_unlimited: account
+            .last_usage
+            .as_ref()
+            .and_then(|usage| usage.credits.as_ref())
+            .and_then(|credits| credits.unlimited),
+        usage_credits_balance: account
+            .last_usage
+            .as_ref()
+            .and_then(|usage| usage.credits.as_ref())
+            .and_then(|credits| credits.balance.as_ref())
+            .and_then(json_value_to_display_string),
         primary_usage: account
             .last_usage
             .as_ref()
@@ -1481,6 +1509,16 @@ fn registry_account_to_dto(
             .as_ref()
             .and_then(|usage| usage.secondary.as_ref())
             .map(usage_window_to_dto),
+    }
+}
+
+fn json_value_to_display_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
