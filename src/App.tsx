@@ -382,6 +382,10 @@ function isAccountDisabledByVerification(account: {
   return account.verificationState === "suspected_disabled";
 }
 
+function isUsageUnauthorized(account: { authStatus: string }) {
+  return account.authStatus === "usage_unauthorized";
+}
+
 function hasKnownRemainingUsage(account: AccountItem) {
   return (
     (account.primaryUsage?.remainingPercent ?? null) !== null ||
@@ -393,6 +397,7 @@ function isKnownUsableAccount(account: AccountItem) {
   if (
     isAccountInvalid(account) ||
     isAccountDisabledByVerification(account) ||
+    isUsageUnauthorized(account) ||
     isSubscriptionExpired(account)
   ) {
     return false;
@@ -420,6 +425,7 @@ function shouldAutoSwitchAccount(account: AccountItem | null | undefined) {
   return (
     isAccountInvalid(account) ||
     isAccountDisabledByVerification(account) ||
+    isUsageUnauthorized(account) ||
     isSubscriptionExpired(account) ||
     isPrimaryUsageExhausted(account) ||
     isUsageDepleted(account.weeklyUsage)
@@ -475,9 +481,6 @@ function getAccountStatusLabel(account: {
   if (isSubscriptionExpired(account)) {
     return "到期";
   }
-  if (isAccountDisabledByVerification(account)) {
-    return isWorkspaceAccount(account.plan) ? "停用" : "不可切换";
-  }
   if (isAccountInvalid(account)) {
     if (isWorkspaceAccount(account.plan)) {
       return "停用";
@@ -485,7 +488,10 @@ function getAccountStatusLabel(account: {
     return "失效";
   }
   if (account.authStatus === "usage_unauthorized") {
-    return account.verificationState ? "API 401" : "待验证";
+    return "不可用";
+  }
+  if (isAccountDisabledByVerification(account)) {
+    return isWorkspaceAccount(account.plan) ? "停用" : "不可切换";
   }
   if (account.authStatus === "warning") {
     return "待验证";
@@ -504,7 +510,8 @@ function getAccountStatusVariant(account: {
   if (
     isSubscriptionExpired(account) ||
     isAccountInvalid(account) ||
-    isAccountDisabledByVerification(account)
+    isAccountDisabledByVerification(account) ||
+    isUsageUnauthorized(account)
   ) {
     return "destructive" as const;
   }
@@ -1847,6 +1854,7 @@ function AccountsPage({
                             account.active ||
                             isAccountInvalid(account) ||
                             isAccountDisabledByVerification(account) ||
+                            isUsageUnauthorized(account) ||
                             switchBusy ||
                             verifyBusy
                           }
