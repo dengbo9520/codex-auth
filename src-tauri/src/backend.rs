@@ -1413,6 +1413,7 @@ fn read_registry_snapshot(
     let mut accounts = parsed
         .accounts
         .into_iter()
+        .filter(|account| account_auth_file_path(dirs, &account.account_key).exists())
         .map(|account| {
             let verification = gui_status_checks.get(&account.account_key);
             registry_account_to_dto(
@@ -1580,10 +1581,7 @@ fn read_account_auth_metadata(
     dirs: &InternalDirectories,
     account_key: &str,
 ) -> AccountAuthMetadata {
-    let path = dirs.accounts_dir.join(format!(
-        "{}.auth.json",
-        base64url_encode(account_key.as_bytes())
-    ));
+    let path = account_auth_file_path(dirs, account_key);
     let file_contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(_) => return AccountAuthMetadata::default(),
@@ -1630,6 +1628,13 @@ fn read_account_auth_metadata(
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
     }
+}
+
+fn account_auth_file_path(dirs: &InternalDirectories, account_key: &str) -> PathBuf {
+    dirs.accounts_dir.join(format!(
+        "{}.auth.json",
+        base64url_encode(account_key.as_bytes())
+    ))
 }
 
 fn parse_jwt_payload(token: &str) -> Option<serde_json::Value> {
