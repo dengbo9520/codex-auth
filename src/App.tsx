@@ -376,6 +376,12 @@ function isPrimaryUsageExhausted(account: AccountItem) {
   return remaining <= 1 && isPaidPlan(account.plan) && hasNoUsageCredits(account);
 }
 
+function isAccountDisabledByVerification(account: {
+  verificationState: string | null;
+}) {
+  return account.verificationState === "suspected_disabled";
+}
+
 function hasKnownRemainingUsage(account: AccountItem) {
   return (
     (account.primaryUsage?.remainingPercent ?? null) !== null ||
@@ -384,7 +390,11 @@ function hasKnownRemainingUsage(account: AccountItem) {
 }
 
 function isKnownUsableAccount(account: AccountItem) {
-  if (isAccountInvalid(account) || isSubscriptionExpired(account)) {
+  if (
+    isAccountInvalid(account) ||
+    isAccountDisabledByVerification(account) ||
+    isSubscriptionExpired(account)
+  ) {
     return false;
   }
   if (
@@ -409,6 +419,7 @@ function shouldAutoSwitchAccount(account: AccountItem | null | undefined) {
   }
   return (
     isAccountInvalid(account) ||
+    isAccountDisabledByVerification(account) ||
     isSubscriptionExpired(account) ||
     isPrimaryUsageExhausted(account) ||
     isUsageDepleted(account.weeklyUsage)
@@ -459,9 +470,13 @@ function getAccountStatusLabel(account: {
   active: boolean;
   authStatus: string;
   authStatusCode: number | null;
+  verificationState: string | null;
 }) {
   if (isSubscriptionExpired(account)) {
     return "到期";
+  }
+  if (isAccountDisabledByVerification(account)) {
+    return isWorkspaceAccount(account.plan) ? "停用" : "不可切换";
   }
   if (isAccountInvalid(account)) {
     if (isWorkspaceAccount(account.plan)) {
@@ -470,7 +485,7 @@ function getAccountStatusLabel(account: {
     return "失效";
   }
   if (account.authStatus === "usage_unauthorized") {
-    return "API 401";
+    return account.verificationState ? "API 401" : "待验证";
   }
   if (account.authStatus === "warning") {
     return "待验证";
@@ -484,8 +499,13 @@ function getAccountStatusVariant(account: {
   active: boolean;
   authStatus: string;
   authStatusCode: number | null;
+  verificationState: string | null;
 }) {
-  if (isSubscriptionExpired(account) || isAccountInvalid(account)) {
+  if (
+    isSubscriptionExpired(account) ||
+    isAccountInvalid(account) ||
+    isAccountDisabledByVerification(account)
+  ) {
     return "destructive" as const;
   }
   return account.active ? ("default" as const) : ("outline" as const);
@@ -1826,6 +1846,7 @@ function AccountsPage({
                           disabled={
                             account.active ||
                             isAccountInvalid(account) ||
+                            isAccountDisabledByVerification(account) ||
                             switchBusy ||
                             verifyBusy
                           }

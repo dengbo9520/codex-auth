@@ -99,6 +99,7 @@ pub(crate) struct InternalDirectories {
     app_log_dir: PathBuf,
     app_log_file: PathBuf,
     verification_cache_file: PathBuf,
+    gui_settings_file: PathBuf,
 }
 
 impl InternalDirectories {
@@ -115,6 +116,7 @@ impl InternalDirectories {
         let _ = fs::create_dir_all(&app_log_dir);
         let app_log_file = app_log_dir.join("command-history.json");
         let verification_cache_file = app_log_dir.join("verification-cache.json");
+        let gui_settings_file = app_log_dir.join("gui-settings.json");
 
         Self {
             codex_root,
@@ -124,6 +126,7 @@ impl InternalDirectories {
             app_log_dir,
             app_log_file,
             verification_cache_file,
+            gui_settings_file,
         }
     }
 
@@ -362,6 +365,12 @@ struct RegistryAutoSwitch {
 struct RegistryApi {
     usage: bool,
     account: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[serde(default)]
+struct GuiSettings {
+    auto_switch_enabled: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -972,9 +981,9 @@ pub fn rebuild_registry(path: Option<String>, state: State<'_, AppState>) -> Mut
 #[tauri::command]
 pub fn set_auto_switch(enabled: bool, state: State<'_, AppState>) -> MutationResultDto {
     let command = match write_auto_switch_enabled(&state.dirs, enabled) {
-        Ok(backup_path) => CommandExecutionDto::synthetic(
+        Ok(settings_path) => CommandExecutionDto::synthetic(
             "config-auto",
-            "registry.json",
+            "gui-settings.json",
             "set GUI auto-switch",
             vec![
                 "config".to_string(),
@@ -984,15 +993,15 @@ pub fn set_auto_switch(enabled: bool, state: State<'_, AppState>) -> MutationRes
             &state.dirs.codex_root,
             true,
             format!(
-                "GUI auto-switch set to {}. Backup: {}",
+                "GUI auto-switch set to {}. Settings: {}",
                 if enabled { "enabled" } else { "disabled" },
-                backup_path
+                settings_path
             ),
             String::new(),
         ),
         Err(error) => CommandExecutionDto::synthetic(
             "config-auto",
-            "registry.json",
+            "gui-settings.json",
             "set GUI auto-switch",
             vec![
                 "config".to_string(),
@@ -1400,6 +1409,7 @@ fn read_registry_snapshot(
     let email_counts = account_email_counts(&parsed.accounts);
     let active_account_key = parsed.active_account_key.clone();
     let gui_status_checks = load_account_verifications(&dirs.verification_cache_file);
+    let gui_settings = load_gui_settings(&dirs.gui_settings_file);
     let mut accounts = parsed
         .accounts
         .into_iter()
@@ -1430,7 +1440,9 @@ fn read_registry_snapshot(
         accounts_dir: path_string(&dirs.accounts_dir),
         active_account_key,
         active_account_activated_at_ms: parsed.active_account_activated_at_ms,
-        auto_switch_enabled: parsed.auto_switch.enabled,
+        auto_switch_enabled: gui_settings
+            .auto_switch_enabled
+            .unwrap_or(parsed.auto_switch.enabled),
         usage_mode: if parsed.api.usage {
             "api".to_string()
         } else {
@@ -2081,13 +2093,23 @@ fn write_account_alias(
 }
 
 fn write_auto_switch_enabled(dirs: &InternalDirectories, enabled: bool) -> Result<String, String> {
-    write_registry_bool(
-        dirs,
-        &["auto_switch", "enabled"],
-        enabled,
-        "auto switch",
-        "auto",
-    )
+    let mut settings = load_gui_settings(&dirs.gui_settings_file);
+    settings.auto_switch_enabled = Some(enabled);
+    fs::create_dir_all(&dirs.app_log_dir).map_err(|error| {
+        format!(
+            "Failed to create GUI settings dir: {} ({error})",
+            dirs.app_log_dir.display()
+        )
+    })?;
+    let serialized = serde_json::to_string_pretty(&settings)
+        .map_err(|error| format!("Failed to serialize GUI settings: {error}"))?;
+    fs::write(&dirs.gui_settings_file, format!("{serialized}\n")).map_err(|error| {
+        format!(
+            "Failed to write GUI settings: {} ({error})",
+            dirs.gui_settings_file.display()
+        )
+    })?;
+    Ok(path_string(&dirs.gui_settings_file))
 }
 
 fn write_usage_api_enabled(dirs: &InternalDirectories, enabled: bool) -> Result<String, String> {
@@ -2100,16 +2122,6 @@ fn write_usage_api_enabled(dirs: &InternalDirectories, enabled: bool) -> Result<
         "usage API",
         "api",
     )
-}
-
-fn write_registry_bool(
-    dirs: &InternalDirectories,
-    path: &[&str],
-    enabled: bool,
-    label: &str,
-    backup_label: &str,
-) -> Result<String, String> {
-    write_registry_bools(dirs, &[(path, enabled)], label, backup_label)
 }
 
 fn write_registry_bools(
@@ -2209,6 +2221,13 @@ fn load_account_verifications(path: &Path) -> HashMap<String, RegistryStatusChec
         .and_then(|contents| {
             serde_json::from_str::<HashMap<String, RegistryStatusCheck>>(&contents).ok()
         })
+        .unwrap_or_default()
+}
+
+fn load_gui_settings(path: &Path) -> GuiSettings {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<GuiSettings>(&contents).ok())
         .unwrap_or_default()
 }
 
@@ -2857,6 +2876,7 @@ mod tests {
             app_log_dir: app_log_dir.clone(),
             app_log_file: app_log_dir.join("command-history.json"),
             verification_cache_file: app_log_dir.join("verification-cache.json"),
+            gui_settings_file: app_log_dir.join("gui-settings.json"),
         };
 
         let backup_path = write_account_alias(&dirs, "key-2", "melissa-plus").expect("set alias");
