@@ -958,7 +958,13 @@ export default function App() {
       },
     );
     if (enabled && isMutationResult(result) && result.command.success) {
-      await maybeRunGuiAutoSwitch(result.registry);
+      const refreshed = await refreshRegistryState({
+        refreshStatus: page === "diagnostics",
+        immediateLocal: true,
+      });
+      if (refreshed.command.success) {
+        await maybeRunGuiAutoSwitch(refreshed.registry);
+      }
     }
   }
 

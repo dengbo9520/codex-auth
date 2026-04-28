@@ -1,7 +1,7 @@
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -560,6 +560,7 @@ pub async fn refresh_registry_snapshot(
             ),
         );
         state.push_log(command.clone());
+        let _ = ensure_unique_aliases(&state.dirs);
         let status_started_at_ms = now_ms();
         let account_auth_statuses = extract_account_auth_statuses(&state.recent_logs());
         state.push_perf(
@@ -609,6 +610,7 @@ pub async fn refresh_registry_snapshot(
 #[tauri::command]
 pub fn get_local_registry_snapshot(state: State<'_, AppState>) -> MutationResultDto {
     let started_at_ms = now_ms();
+    let _ = ensure_unique_aliases(&state.dirs);
     let account_auth_statuses = extract_account_auth_statuses(&state.recent_logs());
     let registry_started_at_ms = now_ms();
     let registry = read_registry_snapshot(&state.dirs, &account_auth_statuses);
@@ -1564,12 +1566,19 @@ fn find_account_auth_status<'a>(
 
 fn account_status_lookup_keys(account: &RegistryAccount) -> Vec<String> {
     let mut keys = Vec::new();
-    if let Some(alias) = trimmed_optional_str(account.alias.as_deref()) {
+    let alias = trimmed_optional_str(account.alias.as_deref());
+    let account_name = trimmed_optional_str(account.account_name.as_deref());
+    if let (Some(alias), Some(account_name)) = (alias, account_name) {
+        keys.push(normalize_account_status_key(
+            format!("{} | {} ({})", account.email, alias, account_name).as_str(),
+        ));
+    }
+    if let Some(alias) = alias {
         keys.push(normalize_account_status_key(
             format!("{} | {}", account.email, alias).as_str(),
         ));
     }
-    if let Some(account_name) = trimmed_optional_str(account.account_name.as_deref()) {
+    if let Some(account_name) = account_name {
         keys.push(normalize_account_status_key(
             format!("{} | {}", account.email, account_name).as_str(),
         ));
@@ -2096,6 +2105,156 @@ fn write_account_alias(
     })?;
 
     Ok(path_string(&backup_path))
+}
+
+fn ensure_unique_aliases(dirs: &InternalDirectories) -> Result<Option<String>, String> {
+    let file_contents = fs::read_to_string(&dirs.registry_path).map_err(|error| {
+        format!(
+            "Failed to read registry before ensuring aliases: {} ({error})",
+            dirs.registry_path.display()
+        )
+    })?;
+    let mut parsed =
+        serde_json::from_str::<serde_json::Value>(&file_contents).map_err(|error| {
+            format!(
+                "Failed to parse registry before ensuring aliases: {} ({error})",
+                dirs.registry_path.display()
+            )
+        })?;
+    let accounts = parsed
+        .get_mut("accounts")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| "registry.json does not contain an accounts array.".to_string())?;
+
+    let mut email_counts: HashMap<String, usize> = HashMap::new();
+    let mut user_counts: HashMap<String, usize> = HashMap::new();
+    let mut used_aliases: HashSet<String> = HashSet::new();
+    for account in accounts.iter() {
+        if let Some(email) = account.get("email").and_then(serde_json::Value::as_str) {
+            *email_counts.entry(email.to_ascii_lowercase()).or_insert(0) += 1;
+        }
+        if let Some(user_id) = account
+            .get("chatgpt_user_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            *user_counts.entry(user_id.to_string()).or_insert(0) += 1;
+        }
+        if let Some(alias) = account.get("alias").and_then(serde_json::Value::as_str) {
+            let trimmed = alias.trim();
+            if !trimmed.is_empty() {
+                used_aliases.insert(trimmed.to_ascii_lowercase());
+            }
+        }
+    }
+
+    let mut changed = false;
+    for account in accounts.iter_mut() {
+        let existing_alias = account
+            .get("alias")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if !existing_alias.is_empty() {
+            continue;
+        }
+
+        let email = account
+            .get("email")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let user_id = account
+            .get("chatgpt_user_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let duplicate_email = email_counts
+            .get(&email.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(0)
+            > 1;
+        let duplicate_user = user_counts.get(user_id).copied().unwrap_or(0) > 1;
+        if !duplicate_email && !duplicate_user {
+            continue;
+        }
+
+        let base = account
+            .get("account_name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                account
+                    .get("plan")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_else(|| email.split('@').next().unwrap_or("account"));
+        let alias = unique_alias_from_base(base, &mut used_aliases);
+        if let Some(object) = account.as_object_mut() {
+            object.insert("alias".to_string(), serde_json::Value::String(alias));
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+
+    let backup_path = dirs
+        .registry_path
+        .with_file_name(format!("registry.json.bak.alias-auto.{}", now_ms()));
+    fs::copy(&dirs.registry_path, &backup_path).map_err(|error| {
+        format!(
+            "Failed to backup registry before ensuring aliases: {} ({error})",
+            backup_path.display()
+        )
+    })?;
+    let serialized = serde_json::to_string_pretty(&parsed)
+        .map_err(|error| format!("Failed to serialize registry after ensuring aliases: {error}"))?;
+    fs::write(&dirs.registry_path, format!("{serialized}\n")).map_err(|error| {
+        format!(
+            "Failed to write registry after ensuring aliases: {} ({error})",
+            dirs.registry_path.display()
+        )
+    })?;
+    Ok(Some(path_string(&backup_path)))
+}
+
+fn unique_alias_from_base(base: &str, used_aliases: &mut HashSet<String>) -> String {
+    let sanitized = sanitize_alias_base(base);
+    let mut alias = sanitized.clone();
+    let mut index = 2;
+    while used_aliases.contains(&alias.to_ascii_lowercase()) {
+        alias = format!("{sanitized}-{index}");
+        index += 1;
+    }
+    used_aliases.insert(alias.to_ascii_lowercase());
+    alias
+}
+
+fn sanitize_alias_base(value: &str) -> String {
+    let mut alias = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '@' | '+') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    while alias.contains("--") {
+        alias = alias.replace("--", "-");
+    }
+    if alias.is_empty() {
+        alias = "account".to_string();
+    }
+    if alias.chars().count() > 48 {
+        alias = alias.chars().take(48).collect();
+        alias = alias.trim_matches('-').to_string();
+    }
+    alias
 }
 
 fn write_auto_switch_enabled(dirs: &InternalDirectories, enabled: bool) -> Result<String, String> {
@@ -2852,8 +3011,48 @@ mod tests {
     }
 
     #[test]
+    fn auth_status_lookup_matches_alias_with_workspace_suffix() {
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            "18780858059@163.com | fvnsjz65175slll (fvnsjz65175s)".to_string(),
+            AccountAuthStatus {
+                state: "ok".to_string(),
+                status_code: Some(200),
+                detail: Some("HTTP 200 (usage-windows)".to_string()),
+                checked_at_ms: 1,
+            },
+        );
+        let account = RegistryAccount {
+            account_key: "key".to_string(),
+            chatgpt_account_id: Some("account".to_string()),
+            chatgpt_user_id: Some("user".to_string()),
+            email: "18780858059@163.com".to_string(),
+            alias: Some("fvnsjz65175slll".to_string()),
+            account_name: Some("fvnsjz65175s".to_string()),
+            plan: Some("team".to_string()),
+            auth_mode: Some("chatgpt".to_string()),
+            created_at: None,
+            last_used_at: None,
+            last_usage: None,
+            last_usage_at: None,
+            last_local_rollout: None,
+        };
+        let counts = account_email_counts(std::slice::from_ref(&account));
+
+        assert_eq!(
+            find_account_auth_status(&account, &statuses, &counts)
+                .map(|status| status.state.as_str()),
+            Some("ok")
+        );
+    }
+
+    #[test]
     fn write_account_alias_updates_target_and_rejects_duplicate() {
-        let root = std::env::temp_dir().join(format!("codex-auth-gui-test-{}", now_ms()));
+        let root = std::env::temp_dir().join(format!(
+            "codex-auth-gui-test-{}-{}",
+            now_ms(),
+            COMMAND_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         let accounts_dir = root.join("accounts");
         let app_log_dir = root.join("app");
         fs::create_dir_all(&accounts_dir).expect("create test accounts dir");
@@ -2910,6 +3109,73 @@ mod tests {
         let duplicate = write_account_alias(&dirs, "key-1", "melissa-plus")
             .expect_err("duplicate alias should fail");
         assert!(duplicate.contains("already used"));
+
+        fs::remove_dir_all(root).expect("remove test dir");
+    }
+
+    #[test]
+    fn ensure_unique_aliases_adds_aliases_for_duplicate_accounts() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-auth-gui-test-{}-{}",
+            now_ms(),
+            COMMAND_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let accounts_dir = root.join("accounts");
+        let app_log_dir = root.join("app");
+        fs::create_dir_all(&accounts_dir).expect("create test accounts dir");
+        fs::create_dir_all(&app_log_dir).expect("create test app dir");
+        let registry_path = accounts_dir.join("registry.json");
+        fs::write(
+            &registry_path,
+            r#"{
+  "schema_version": 1,
+  "accounts": [
+    {
+      "account_key": "key-1",
+      "chatgpt_user_id": "user-1",
+      "email": "same@example.com",
+      "alias": "existing",
+      "account_name": "Workspace"
+    },
+    {
+      "account_key": "key-2",
+      "chatgpt_user_id": "user-1",
+      "email": "same@example.com",
+      "alias": "",
+      "account_name": "Workspace"
+    },
+    {
+      "account_key": "key-3",
+      "chatgpt_user_id": "user-1",
+      "email": "same@example.com",
+      "account_name": "Other Space"
+    }
+  ]
+}"#,
+        )
+        .expect("write test registry");
+        let dirs = InternalDirectories {
+            codex_root: root.clone(),
+            accounts_dir,
+            sessions_dir: root.join("sessions"),
+            registry_path: registry_path.clone(),
+            app_log_dir: app_log_dir.clone(),
+            app_log_file: app_log_dir.join("command-history.json"),
+            verification_cache_file: app_log_dir.join("verification-cache.json"),
+            gui_settings_file: app_log_dir.join("gui-settings.json"),
+        };
+
+        let _ = ensure_unique_aliases(&dirs).expect("ensure aliases");
+        let parsed = serde_json::from_str::<RegistryFile>(
+            &fs::read_to_string(&registry_path).expect("read updated registry"),
+        )
+        .expect("parse updated registry");
+        let aliases = parsed
+            .accounts
+            .iter()
+            .map(|account| account.alias.as_deref().unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert_eq!(aliases, vec!["existing", "Workspace", "Other-Space"]);
 
         fs::remove_dir_all(root).expect("remove test dir");
     }
