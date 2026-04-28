@@ -1753,6 +1753,7 @@ fn parse_account_auth_statuses(log: &CommandExecutionDto) -> HashMap<String, Acc
         let state = match status_code {
             Some(200) => "ok".to_string(),
             Some(401) => "usage_unauthorized".to_string(),
+            Some(402) => "disabled".to_string(),
             Some(_) => "warning".to_string(),
             None => "unknown".to_string(),
         };
@@ -2720,7 +2721,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_account_auth_statuses_marks_401_as_usage_unauthorized() {
+    fn parse_account_auth_statuses_marks_401_and_402_states() {
         let log = CommandExecutionDto {
             id: "cmd-test".to_string(),
             category: "refresh-registry".to_string(),
@@ -2734,7 +2735,7 @@ mod tests {
             exit_code: Some(0),
             success: true,
             timed_out: false,
-            stdout: "[debug] response usage: 18780858059@163.com status=401 result=http-response\n[debug] response usage: melissamontgomery6442@hotmail.com status=200 result=usage-windows\n[debug] response usage: tracycox8658@hotmail.com | LizzieDibberttm status=401 result=http-response".to_string(),
+            stdout: "[debug] response usage: 18780858059@163.com status=401 result=http-response\n[debug] response usage: melissamontgomery6442@hotmail.com status=200 result=usage-windows\n[debug] response usage: tracycox8658@hotmail.com | LizzieDibberttm status=401 result=http-response\n[debug] response usage: banned@example.com | DeadSpace status=402 result=http-response".to_string(),
             stderr: String::new(),
         };
 
@@ -2757,6 +2758,12 @@ mod tests {
                 .get("tracycox8658@hotmail.com | lizziedibberttm")
                 .map(|value| value.state.as_str()),
             Some("usage_unauthorized")
+        );
+        assert_eq!(
+            statuses
+                .get("banned@example.com | deadspace")
+                .map(|value| value.state.as_str()),
+            Some("disabled")
         );
     }
 

@@ -325,6 +325,10 @@ function isAccountInvalid(account: {
   return account.authStatus === "invalid";
 }
 
+function isAccountDisabledByStatus(account: { authStatus: string }) {
+  return account.authStatus === "disabled";
+}
+
 function isPaidPlan(plan: string | null | undefined) {
   const normalized = plan?.trim().toLowerCase();
   return (
@@ -396,6 +400,7 @@ function hasKnownRemainingUsage(account: AccountItem) {
 function isKnownUsableAccount(account: AccountItem) {
   if (
     isAccountInvalid(account) ||
+    isAccountDisabledByStatus(account) ||
     isAccountDisabledByVerification(account) ||
     isUsageUnauthorized(account) ||
     isSubscriptionExpired(account)
@@ -424,6 +429,7 @@ function shouldAutoSwitchAccount(account: AccountItem | null | undefined) {
   }
   return (
     isAccountInvalid(account) ||
+    isAccountDisabledByStatus(account) ||
     isAccountDisabledByVerification(account) ||
     isUsageUnauthorized(account) ||
     isSubscriptionExpired(account) ||
@@ -481,6 +487,9 @@ function getAccountStatusLabel(account: {
   if (isSubscriptionExpired(account)) {
     return "到期";
   }
+  if (isAccountDisabledByStatus(account)) {
+    return isWorkspaceAccount(account.plan) ? "停用" : "封停";
+  }
   if (isAccountInvalid(account)) {
     if (isWorkspaceAccount(account.plan)) {
       return "停用";
@@ -510,6 +519,7 @@ function getAccountStatusVariant(account: {
   if (
     isSubscriptionExpired(account) ||
     isAccountInvalid(account) ||
+    isAccountDisabledByStatus(account) ||
     isAccountDisabledByVerification(account) ||
     isUsageUnauthorized(account)
   ) {
@@ -1853,6 +1863,7 @@ function AccountsPage({
                           disabled={
                             account.active ||
                             isAccountInvalid(account) ||
+                            isAccountDisabledByStatus(account) ||
                             isAccountDisabledByVerification(account) ||
                             isUsageUnauthorized(account) ||
                             switchBusy ||
