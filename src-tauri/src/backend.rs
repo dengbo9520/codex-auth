@@ -650,6 +650,7 @@ pub fn get_local_registry_snapshot(state: State<'_, AppState>) -> MutationResult
 
 #[tauri::command]
 pub fn switch_account(query: String, state: State<'_, AppState>) -> MutationResultDto {
+    let _ = ensure_unique_aliases(&state.dirs);
     let selector = resolve_account_selector(&state.dirs, &query, "switch");
     let target_account_key = selector
         .as_ref()
@@ -1954,15 +1955,7 @@ fn resolve_account_selector(
     };
 
     if let Some(alias) = clean_optional(target.alias.clone()) {
-        let count = parsed
-            .accounts
-            .iter()
-            .filter(|account| {
-                clean_optional(account.alias.clone())
-                    .map(|value| value.eq_ignore_ascii_case(&alias))
-                    .unwrap_or(false)
-            })
-            .count();
+        let count = registry_selector_match_count(&parsed.accounts, &alias);
         if count == 1 {
             return Ok(AccountSelector {
                 query: alias,
@@ -1972,15 +1965,7 @@ fn resolve_account_selector(
     }
 
     if let Some(account_name) = clean_optional(target.account_name.clone()) {
-        let count = parsed
-            .accounts
-            .iter()
-            .filter(|account| {
-                clean_optional(account.account_name.clone())
-                    .map(|value| value.eq_ignore_ascii_case(&account_name))
-                    .unwrap_or(false)
-            })
-            .count();
+        let count = registry_selector_match_count(&parsed.accounts, &account_name);
         if count == 1 {
             return Ok(AccountSelector {
                 query: account_name,
@@ -1989,11 +1974,7 @@ fn resolve_account_selector(
         }
     }
 
-    let email_count = parsed
-        .accounts
-        .iter()
-        .filter(|account| account.email.eq_ignore_ascii_case(&target.email))
-        .count();
+    let email_count = registry_selector_match_count(&parsed.accounts, &target.email);
     if email_count == 1 {
         return Ok(AccountSelector {
             query: target.email.clone(),
@@ -2005,6 +1986,33 @@ fn resolve_account_selector(
         "Cannot {verb} account non-interactively: '{}' matches {email_count} accounts and this account has no unique alias or workspace name.",
         target.email
     ))
+}
+
+fn registry_selector_match_count(accounts: &[RegistryAccount], selector: &str) -> usize {
+    accounts
+        .iter()
+        .filter(|account| registry_account_matches_selector(account, selector))
+        .count()
+}
+
+fn registry_account_matches_selector(account: &RegistryAccount, selector: &str) -> bool {
+    selector_value_matches(&account.email, selector)
+        || account
+            .alias
+            .as_deref()
+            .map(|value| selector_value_matches(value, selector))
+            .unwrap_or(false)
+        || account
+            .account_name
+            .as_deref()
+            .map(|value| selector_value_matches(value, selector))
+            .unwrap_or(false)
+}
+
+fn selector_value_matches(value: &str, selector: &str) -> bool {
+    let value = value.trim();
+    let selector = selector.trim();
+    !value.is_empty() && value.eq_ignore_ascii_case(selector)
 }
 
 fn write_account_alias(
@@ -2128,10 +2136,11 @@ fn ensure_unique_aliases(dirs: &InternalDirectories) -> Result<Option<String>, S
 
     let mut email_counts: HashMap<String, usize> = HashMap::new();
     let mut user_counts: HashMap<String, usize> = HashMap::new();
-    let mut used_aliases: HashSet<String> = HashSet::new();
+    let mut used_selectors: HashSet<String> = HashSet::new();
     for account in accounts.iter() {
         if let Some(email) = account.get("email").and_then(serde_json::Value::as_str) {
             *email_counts.entry(email.to_ascii_lowercase()).or_insert(0) += 1;
+            used_selectors.insert(email.trim().to_ascii_lowercase());
         }
         if let Some(user_id) = account
             .get("chatgpt_user_id")
@@ -2142,19 +2151,67 @@ fn ensure_unique_aliases(dirs: &InternalDirectories) -> Result<Option<String>, S
         if let Some(alias) = account.get("alias").and_then(serde_json::Value::as_str) {
             let trimmed = alias.trim();
             if !trimmed.is_empty() {
-                used_aliases.insert(trimmed.to_ascii_lowercase());
+                used_selectors.insert(trimmed.to_ascii_lowercase());
+            }
+        }
+        if let Some(account_name) = account
+            .get("account_name")
+            .and_then(serde_json::Value::as_str)
+        {
+            let trimmed = account_name.trim();
+            if !trimmed.is_empty() {
+                used_selectors.insert(trimmed.to_ascii_lowercase());
             }
         }
     }
 
+    let alias_repair_keys = accounts
+        .iter()
+        .filter_map(|account| {
+            let account_key = account
+                .get("account_key")
+                .and_then(serde_json::Value::as_str)?;
+            let existing_alias = account
+                .get("alias")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let email = account
+                .get("email")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let user_id = account
+                .get("chatgpt_user_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let duplicate_email = email_counts
+                .get(&email.to_ascii_lowercase())
+                .copied()
+                .unwrap_or(0)
+                > 1;
+            let duplicate_user = user_counts.get(user_id).copied().unwrap_or(0) > 1;
+            let alias_collides = !existing_alias.is_empty()
+                && json_selector_match_count(accounts, existing_alias) > 1;
+            if (existing_alias.is_empty() && (duplicate_email || duplicate_user))
+                || alias_collides
+            {
+                Some(account_key.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<HashSet<_>>();
+
     let mut changed = false;
     for account in accounts.iter_mut() {
-        let existing_alias = account
-            .get("alias")
+        let Some(account_key) = account
+            .get("account_key")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .trim();
-        if !existing_alias.is_empty() {
+        else {
+            continue;
+        };
+
+        if !alias_repair_keys.contains(account_key) {
             continue;
         }
 
@@ -2162,20 +2219,6 @@ fn ensure_unique_aliases(dirs: &InternalDirectories) -> Result<Option<String>, S
             .get("email")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        let user_id = account
-            .get("chatgpt_user_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let duplicate_email = email_counts
-            .get(&email.to_ascii_lowercase())
-            .copied()
-            .unwrap_or(0)
-            > 1;
-        let duplicate_user = user_counts.get(user_id).copied().unwrap_or(0) > 1;
-        if !duplicate_email && !duplicate_user {
-            continue;
-        }
-
         let base = account
             .get("account_name")
             .and_then(serde_json::Value::as_str)
@@ -2187,7 +2230,7 @@ fn ensure_unique_aliases(dirs: &InternalDirectories) -> Result<Option<String>, S
                     .filter(|value| !value.trim().is_empty())
             })
             .unwrap_or_else(|| email.split('@').next().unwrap_or("account"));
-        let alias = unique_alias_from_base(base, &mut used_aliases);
+        let alias = unique_alias_from_base(base, &mut used_selectors);
         if let Some(object) = account.as_object_mut() {
             object.insert("alias".to_string(), serde_json::Value::String(alias));
             changed = true;
@@ -2216,6 +2259,23 @@ fn ensure_unique_aliases(dirs: &InternalDirectories) -> Result<Option<String>, S
         )
     })?;
     Ok(Some(path_string(&backup_path)))
+}
+
+fn json_selector_match_count(accounts: &[serde_json::Value], selector: &str) -> usize {
+    accounts
+        .iter()
+        .filter(|account| json_account_matches_selector(account, selector))
+        .count()
+}
+
+fn json_account_matches_selector(account: &serde_json::Value, selector: &str) -> bool {
+    ["email", "alias", "account_name"].iter().any(|field| {
+        account
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(|value| selector_value_matches(value, selector))
+            .unwrap_or(false)
+    })
 }
 
 fn unique_alias_from_base(base: &str, used_aliases: &mut HashSet<String>) -> String {
@@ -3175,7 +3235,71 @@ mod tests {
             .iter()
             .map(|account| account.alias.as_deref().unwrap_or(""))
             .collect::<Vec<_>>();
-        assert_eq!(aliases, vec!["existing", "Workspace", "Other-Space"]);
+        assert_eq!(aliases, vec!["existing", "Workspace-2", "Other-Space"]);
+
+        fs::remove_dir_all(root).expect("remove test dir");
+    }
+
+    #[test]
+    fn ensure_unique_aliases_rewrites_alias_that_collides_with_workspace_name() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-auth-gui-test-{}-{}",
+            now_ms(),
+            COMMAND_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let accounts_dir = root.join("accounts");
+        let app_log_dir = root.join("app");
+        fs::create_dir_all(&accounts_dir).expect("create test accounts dir");
+        fs::create_dir_all(&app_log_dir).expect("create test app dir");
+        let registry_path = accounts_dir.join("registry.json");
+        fs::write(
+            &registry_path,
+            r#"{
+  "schema_version": 1,
+  "accounts": [
+    {
+      "account_key": "key-1",
+      "chatgpt_user_id": "user-1",
+      "email": "one@example.com",
+      "alias": "one",
+      "account_name": "SharedSpace"
+    },
+    {
+      "account_key": "key-2",
+      "chatgpt_user_id": "user-2",
+      "email": "two@example.com",
+      "alias": "SharedSpace",
+      "account_name": "SharedSpace"
+    }
+  ]
+}"#,
+        )
+        .expect("write test registry");
+        let dirs = InternalDirectories {
+            codex_root: root.clone(),
+            accounts_dir,
+            sessions_dir: root.join("sessions"),
+            registry_path: registry_path.clone(),
+            app_log_dir: app_log_dir.clone(),
+            app_log_file: app_log_dir.join("command-history.json"),
+            verification_cache_file: app_log_dir.join("verification-cache.json"),
+            gui_settings_file: app_log_dir.join("gui-settings.json"),
+        };
+
+        let _ = ensure_unique_aliases(&dirs).expect("ensure aliases");
+        let parsed = serde_json::from_str::<RegistryFile>(
+            &fs::read_to_string(&registry_path).expect("read updated registry"),
+        )
+        .expect("parse updated registry");
+        let key_2_alias = parsed
+            .accounts
+            .iter()
+            .find(|account| account.account_key == "key-2")
+            .and_then(|account| account.alias.as_deref());
+        assert_eq!(key_2_alias, Some("SharedSpace-2"));
+
+        let selector = resolve_account_selector(&dirs, "key-2", "switch").expect("selector");
+        assert_eq!(selector.query, "SharedSpace-2");
 
         fs::remove_dir_all(root).expect("remove test dir");
     }

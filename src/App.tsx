@@ -87,6 +87,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { refreshResultSupportsAutomation } from "@/auto-switch-policy";
 import { useRegistryEvents } from "@/hooks/use-registry-events";
 import { api } from "@/lib/api";
 import {
@@ -744,7 +745,11 @@ export default function App() {
 
     const result = await api.refreshRegistrySnapshot();
 
-    if (!result.command.success && options?.toastOnFailure) {
+    if (
+      !result.command.success &&
+      options?.toastOnFailure &&
+      !refreshResultSupportsAutomation(result)
+    ) {
       toast.error("刷新失败", {
         description: buildActionError(result.command),
       });
@@ -962,9 +967,7 @@ export default function App() {
         refreshStatus: page === "diagnostics",
         immediateLocal: true,
       });
-      if (refreshed.command.success) {
-        await maybeRunGuiAutoSwitch(refreshed.registry);
-      }
+      await runPostRefreshAutomation(refreshed, "toggle-auto-switch");
     }
   }
 
@@ -1073,6 +1076,7 @@ export default function App() {
         accountCount: result.registry.accounts.length,
         stderr: result.command.stderr,
       });
+      await runPostRefreshAutomation(result, "manual-refresh");
     } finally {
       const remainingMs = MIN_MANUAL_REFRESH_BUSY_MS - (performance.now() - startedAt);
       if (remainingMs > 0) {
@@ -1137,6 +1141,26 @@ export default function App() {
         description: buildActionError(result.command),
       });
     }
+  }
+
+  async function runPostRefreshAutomation(
+    result: MutationResultDto,
+    source: string,
+  ) {
+    const supported = refreshResultSupportsAutomation(result);
+    await logUiEvent("refresh-automation-check", {
+      source,
+      supported,
+      success: result.command.success,
+      timedOut: result.command.timedOut,
+      accountCount: result.registry.accounts.length,
+    });
+    if (!supported) {
+      return;
+    }
+
+    await maybeRunAutoVerification(result.registry);
+    await maybeRunGuiAutoSwitch(result.registry);
   }
 
   async function maybeRunAutoVerification(registry: AppSnapshotDto["registry"]) {
@@ -1247,10 +1271,7 @@ export default function App() {
         accountCount: result.registry.accounts.length,
         stderr: result.command.stderr,
       });
-      if (result.command.success) {
-        await maybeRunAutoVerification(result.registry);
-        await maybeRunGuiAutoSwitch(result.registry);
-      }
+      await runPostRefreshAutomation(result, "background-refresh");
     } finally {
       backgroundRefreshInFlightRef.current = false;
       setBackgroundRefreshPending(false);
